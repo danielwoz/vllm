@@ -177,7 +177,9 @@ class CompressorStateCache(torch.nn.Module, AttentionLayerBase):
             head_size=self.state_dim,
             dtype=self.dtype,
             sliding_window=self.sliding_window,
+            cache_dtype_str=vllm_config.cache_config.cache_dtype,
             alignment=576 if uses_fp8_ds_mla_layout else 512,
+            model_version="deepseek_v4",
         )
 
     def forward(self): ...
@@ -384,7 +386,15 @@ class DeepseekCompressor(nn.Module):
         # cutedsl (head=512) accepts the full-cache flags; triton (indexer/AMD)
         # does not, so the two callables have different signatures.
         compress_norm_rope_store_fn: Any
-        if current_platform.is_cuda() and self.head_dim == 512:
+        # nvfp4_ds_mla: the head=512 compressed-cache page is 360 B/token
+        # (224 B packed E2M1 NoPE + 128 B bf16 RoPE + 8 B UE8M0 footer)
+        # instead of fp8_ds_mla's 584. Detected by page byte width.
+        use_nvfp4_cache = (
+            self.head_dim == 512
+            and kv_cache.dtype == torch.uint8
+            and kv_cache.shape[-1] == 360
+        )
+        if current_platform.is_cuda() and self.head_dim == 512 and not use_nvfp4_cache:
             from .nvidia.ops.sparse_attn_compress_cutedsl import (
                 compress_norm_rope_store_cutedsl,
             )
@@ -410,7 +420,7 @@ class DeepseekCompressor(nn.Module):
         else:
             # Indexer path (head_dim == 128) or non-CUDA GPUs (AMD, XPU, etc.).
             compress_norm_rope_store_fn = compress_norm_rope_store_triton
-            extra_kwargs = {}
+            extra_kwargs = {"use_nvfp4": True} if use_nvfp4_cache else {}
 
         compress_norm_rope_store_fn(
             state_cache=state_cache,

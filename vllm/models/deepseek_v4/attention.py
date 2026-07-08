@@ -79,9 +79,25 @@ def _resolve_dsv4_kv_cache_dtype(
     token's KV row in its element dtype: bf16 or per-tensor FP8 E4M3.
     """
     if use_fp8_ds_mla_layout:
+        # nvfp4_ds_mla block format: E2M1 NoPE + bf16 RoPE + UE8M0 footer,
+        # 360B/token, packed as uint8. FlashMLA-sparse and FlashInfer-sparse
+        # SM120 use this ds_mla layout (use_fp8_ds_mla_layout is True); the SM100
+        # plain-row FlashInfer path leaves it False.
+        if kv_cache_dtype in ("nvfp4", "nvfp4_ds_mla"):
+            if kv_cache_dtype != "nvfp4_ds_mla":
+                if cache_config is not None:
+                    cache_config.cache_dtype = "nvfp4_ds_mla"
+                kv_cache_dtype = "nvfp4_ds_mla"
+                logger.info_once(
+                    "Using DeepSeek's nvfp4_ds_mla KV cache format."
+                )
+            return kv_cache_dtype, torch.uint8
         # fp8_ds_mla block format: UE8M0 block-scaled fp8 packed as uint8.
-        assert kv_cache_dtype.startswith("fp8"), (
-            f"DeepseekV4 fp8_ds_mla layout only supports fp8 kv-cache, "
+        assert kv_cache_dtype.startswith("fp8") or kv_cache_dtype in (
+            "nvfp4",
+            "nvfp4_ds_mla",
+        ), (
+            f"DeepseekV4 ds_mla layout only supports fp8 or nvfp4 kv-cache, "
             f"got {kv_cache_dtype}"
         )
         if kv_cache_dtype != "fp8_ds_mla":
@@ -551,6 +567,17 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             #            the padded q tensor.
             #   KV side: GPT-J RoPE + UE8M0 FP8 quant + paged cache insert.
             swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
+            if swa_kv_cache.shape[-1] == 360:  # nvfp4_ds_mla page
+                from .nvfp4_qpad import qnorm_rope_pad
+                from .nvfp4_store import store_nvfp4_kv
+                # Q: per-head RMSNorm (no weight) + GPT-J rope + pad.
+                # KV: 360B NVFP4 page via the Triton store.
+                q = qnorm_rope_pad(q, positions, cos_sin_cache,
+                                   self.padded_heads, self.eps)
+                store_nvfp4_kv(kv, swa_kv_cache_2d, swa_metadata.slot_mapping,
+                               positions, cos_sin_cache,
+                               swa_metadata.block_size)
+                return q
             return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
                 q,
                 kv,

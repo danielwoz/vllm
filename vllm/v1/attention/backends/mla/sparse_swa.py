@@ -138,6 +138,10 @@ class DeepseekSparseSWABackend(AttentionBackend):
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
         assert num_kv_heads == 1
+        if cache_dtype_str == "nvfp4_ds_mla":
+            # DeepseekV4 SWA NVFP4: 360B per token (224 E2M1 NoPE + 128 bf16 RoPE
+            # + 8 UE8M0 footer). head_size passed in is the semantic head_dim (512).
+            return (num_blocks, block_size, 360)
         if cache_dtype_str == "fp8_ds_mla":
             # DeepseekV4 SWA: 584B per token (448 NoPE + 128 RoPE + 8 fp8 scale).
             # head_size passed in is the semantic head_dim (512).

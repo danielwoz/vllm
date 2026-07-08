@@ -74,6 +74,8 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4FlashMLABackend):
         "fp8",
         "fp8_e4m3",
         "fp8_ds_mla",
+        "nvfp4_ds_mla",
+        "nvfp4",
     ]
 
     @staticmethod
@@ -123,7 +125,13 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4FlashMLABackend):
                 return "kv_cache_dtype not supported"
             return None
         if device_capability.major == 12:
-            if kv_cache_dtype not in ("fp8", "fp8_e4m3", "fp8_ds_mla"):
+            if kv_cache_dtype not in (
+                "fp8",
+                "fp8_e4m3",
+                "fp8_ds_mla",
+                "nvfp4_ds_mla",
+                "nvfp4",
+            ):
                 return "kv_cache_dtype not supported"
             from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
 
@@ -776,6 +784,7 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             bmm1_scale=self.scale,
             sinks=self.attn_sink,
             kv_layout="NHD",
+            kv_scale_format="nvfp4" if self.kv_cache_dtype == "nvfp4_ds_mla" else "auto",
             swa_topk_lens=swa_lens,
             extra_sparse_indices=extra_sparse_indices,
             extra_sparse_topk_lens=extra_sparse_lengths,
@@ -895,6 +904,9 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 bmm1_scale=self.scale,
                 sinks=self.attn_sink,
                 kv_layout="NHD",
+                kv_scale_format=(
+                    "nvfp4" if self.kv_cache_dtype == "nvfp4_ds_mla" else "auto"
+                ),
                 swa_topk_lens=swa_lens_chunk,
                 extra_sparse_indices=extra_sparse_indices_chunk,
                 extra_sparse_topk_lens=extra_sparse_lengths_chunk,

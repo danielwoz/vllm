@@ -161,6 +161,21 @@ class DSparkDeepseekV4Model(nn.Module):
             kv = attn.kv_norm(kv)
             if slot_mapping is None:
                 continue
+            swa_kv_cache = attn.swa_cache_layer.kv_cache
+            if swa_kv_cache.shape[-1] == 360:  # nvfp4_ds_mla page
+                from ..nvfp4_store import store_nvfp4_kv
+
+                # The fused insert op writes the fp8_ds_mla 584 B page; the
+                # nvfp4 page is stored by the standalone Triton kernel instead.
+                store_nvfp4_kv(
+                    kv.contiguous(),
+                    swa_kv_cache.view(swa_kv_cache.shape[0], -1),
+                    slot_mapping,
+                    context_positions,
+                    attn.rotary_emb.cos_sin_cache,
+                    attn.swa_cache_layer.block_size,
+                )
+                continue
             _insert_context_kv(attn, kv, context_positions, slot_mapping)
 
     def forward(
