@@ -669,6 +669,17 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
             if "mtp" in name:
                 continue
 
+            if (
+                name.endswith(".weight_scale_inv")
+                and loaded_weight.dtype == torch.uint8
+            ):
+                # ModelOpt MXFP8 checkpoints store the E8M0 block scales as
+                # uint8 tensors named `weight_scale_inv`, while the MXFP8
+                # linear method registers the parameter as `weight_scale`.
+                # Block-FP8 (Pro format) scales are float32 and keep their
+                # original name.
+                name = name.removesuffix("weight_scale_inv") + "weight_scale"
+
             expert_matched = False
             for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
                 if weight_name not in name:
@@ -798,6 +809,17 @@ class MiMoV2Model(nn.Module, EagleModelMixin):
             # Weight is not in FP8 format. Ignore.
             return False
 
+        # The re-sharding below is specific to the Pro-format block-FP8
+        # layout, identified by the layer's `weight_scale_inv` parameter.
+        # ModelOpt MXFP8 checkpoints also store fp8 qkv_proj weights, but in
+        # plain [Q|K|V] row order with per-row E8M0 scales (registered as
+        # `weight_scale`); those load through the standard fused-QKV path.
+        scale_param_name = name.rsplit(".", 1)[0] + ".weight_scale_inv"
+        if scale_param_name not in params_dict and not is_pp_missing_parameter(
+            scale_param_name, self
+        ):
+            return False
+
         if is_pp_missing_parameter(name, self):
             # This qkv_proj is for a layer not on this PP rank.
             return True
@@ -895,7 +917,12 @@ class MiMoV2FlashForCausalLM(nn.Module, SupportsPP, MixtureOfExperts, SupportsEa
         return self.model.get_expert_mapping()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        loader = AutoWeightsLoader(self)
+        # Omni checkpoints bundle vision/audio towers that the text-only
+        # model does not instantiate.
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=["visual.", "audio_encoder.", "speech_embeddings."],
+        )
         return loader.load_weights(weights)
 
 
