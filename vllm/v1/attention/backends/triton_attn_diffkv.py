@@ -71,10 +71,13 @@ class TritonAttentionDiffKVBackend(TritonAttentionBackend):
     # V head dim — set per layer via ``set_head_size_v`` before instantiation.
     head_size_v: int = 128
 
-    # No FP8 / int8 KV cache for the DiffKV path yet; require fp16/bf16/fp32.
+    # Unquantized and FP8 per-tensor KV caches are supported; per-token-head
+    # quantization modes are not.
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
         "bfloat16",
+        "fp8",
+        "fp8_e4m3",
     ]
 
     @classmethod
@@ -153,11 +156,6 @@ class TritonAttentionDiffKVImpl(TritonAttentionImpl):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        if is_quantized_kv_cache(self.kv_cache_dtype):
-            raise NotImplementedError(
-                "TritonAttentionDiffKVBackend does not yet support quantized "
-                f"KV cache (got kv_cache_dtype={self.kv_cache_dtype!r})."
-            )
         if self._is_per_token_head_quant:
             raise NotImplementedError(
                 "TritonAttentionDiffKVBackend does not support per-token-head "
@@ -168,6 +166,9 @@ class TritonAttentionDiffKVImpl(TritonAttentionImpl):
                 "TritonAttentionDiffKVBackend does not support chunked "
                 "attention with lookback."
             )
+        # The DiffKV kernel dequantizes FP8 K/V tiles against a bf16/fp16
+        # query; keep the query unquantized.
+        self.supports_quant_query_input = False
 
     def do_kv_cache_update(
         self,
@@ -237,6 +238,16 @@ class TritonAttentionDiffKVImpl(TritonAttentionImpl):
         key_cache = kv_cache[..., :head_size_qk]
         value_cache = kv_cache[..., head_size_qk : head_size_qk + head_size_v]
 
+        if is_quantized_kv_cache(self.kv_cache_dtype):
+            if key_cache.dtype != self.fp8_dtype:
+                key_cache = key_cache.view(self.fp8_dtype)
+                value_cache = value_cache.view(self.fp8_dtype)
+            k_descale = layer._k_scale
+            v_descale = layer._v_scale
+        else:
+            k_descale = None
+            v_descale = None
+
         unified_attention_diffkv(
             q=query[:num_actual_tokens],
             k=key_cache,
@@ -258,5 +269,8 @@ class TritonAttentionDiffKVImpl(TritonAttentionImpl):
             softmax_segm_output=attn_metadata.softmax_segm_output,
             softmax_segm_max=attn_metadata.softmax_segm_max,
             softmax_segm_expsum=attn_metadata.softmax_segm_expsum,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            kv_quant_mode=self._kv_quant_mode,
         )
         return output

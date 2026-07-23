@@ -41,6 +41,8 @@ from vllm.v1.attention.ops.triton_attention_helpers import (
     softmax_step,
     store_segm_reduce_scalars,
 )
+from vllm.v1.attention.ops.triton_unified_attention import _cast_kv_tile
+from vllm.v1.kv_cache_interface import KVQuantMode
 
 logger = init_logger(__name__)
 
@@ -65,6 +67,8 @@ def kernel_unified_attention_diffkv(
     seq_lens_ptr,
     alibi_slopes_ptr,
     scale,
+    k_scale,  # per-tensor K descale (used iff KV_QUANT_MODE == 1)
+    v_scale,  # per-tensor V descale (used iff KV_QUANT_MODE == 1)
     softcap,
     num_query_heads: tl.constexpr,
     num_queries_per_kv: tl.constexpr,
@@ -103,6 +107,8 @@ def kernel_unified_attention_diffkv(
     # sequence) and 3D layout (split-KV / FlashDecoding-style: per-segm
     # programs write partials, finalized by ``kernel_reduce_segments_diffkv``).
     IS_3D: tl.constexpr,
+    # 0 = NONE, 1 = FP8 per-tensor (see KVQuantMode).
+    KV_QUANT_MODE: tl.constexpr = 0,
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -212,14 +218,14 @@ def kernel_unified_attention_diffkv(
             mask=dim_mask_qk[:, None] & tile_mask[None, :],
             other=0.0,
         )
-        K = K_load.to(Q.dtype)
+        K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
         # V : (TILE_SIZE, HEAD_SIZE_V_PADDED)
         V_load = tl.load(
             value_cache_ptr + v_offset,
             mask=dim_mask_v[None, :] & tile_mask[:, None],
             other=0.0,
         )
-        V = V_load.to(Q.dtype)
+        V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
 
         query_abs_pos = context_len + query_pos[:, None]
         seq_mask = compute_kv_seq_mask(
@@ -403,8 +409,16 @@ def unified_attention_diffkv(
     softmax_segm_output: torch.Tensor | None = None,
     softmax_segm_max: torch.Tensor | None = None,
     softmax_segm_expsum: torch.Tensor | None = None,
+    # FP8 per-tensor KV cache descales.
+    k_descale: torch.Tensor | None = None,
+    v_descale: torch.Tensor | None = None,
+    kv_quant_mode: KVQuantMode = KVQuantMode.NONE,
 ):
     assert causal, "Only causal attention is supported"
+    assert kv_quant_mode in (KVQuantMode.NONE, KVQuantMode.FP8_PER_TENSOR), (
+        f"unified_attention_diffkv only supports unquantized or FP8 "
+        f"per-tensor KV caches, got {kv_quant_mode.name}"
+    )
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
@@ -475,6 +489,8 @@ def unified_attention_diffkv(
         seq_lens_ptr=seqused_k,
         alibi_slopes_ptr=alibi_slopes,
         scale=softmax_scale,
+        k_scale=k_descale,
+        v_scale=v_descale,
         softcap=softcap,
         num_query_heads=num_query_heads,
         num_queries_per_kv=num_queries_per_kv,
@@ -508,6 +524,7 @@ def unified_attention_diffkv(
         BLOCK_M=BLOCK_M,
         NUM_SEGMENTS_PER_SEQ=num_segments,
         IS_3D=use_3d,
+        KV_QUANT_MODE=kv_quant_mode,
     )
 
     if use_3d:
