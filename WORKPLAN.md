@@ -97,7 +97,9 @@ TP=1 and TP=2 (torchrun, gloo) both PASS:
 
 ## Remaining work
 
-### Phase 1: GPU bring-up (blocked until the benchmark container is done)
+### Phase 1: GPU bring-up — DONE (2026-07-23)
+
+Bring-up succeeded on the 2x RTX PRO 6000 (TP=2). Verified serve command:
 
 ```bash
 source ~/vllm-mimo/.venv/bin/activate
@@ -107,19 +109,36 @@ HF_HOME=/data/models/hf-cache vllm serve lukealonso/MiMo-V2.5-NVFP4 \
     --max-model-len 32768
 ```
 
-- Confirm attention backend: expect `TRITON_ATTN_DIFFKV` on SM120
-  (FLASH_ATTN_DIFFKV needs FA3/FA4; `get_flash_attn_version` returns FA2
-  for capability major 12).
-- Confirm NVFP4 MoE backend selection (flashinfer not installed:
-  VLLM_CUTLASS, else MARLIN; try `flashinfer_b12x` explicitly later) and
-  MXFP8 linear kernel (likely Marlin without flashinfer; the emulation
-  kernel dequantizes to BF16 at load, +~3 GB weights — avoid).
-- Memory: 183 GB checkpoint on 2x96 GB is tight; start with modest
-  `--max-model-len` / `--gpu-memory-utilization`, then grow.
-- Quality: greedy sanity prompts, then compare against the sglang
-  reference serve on the same checkpoint (quality benchmark already run
-  on this host).
-- Validate long-context needle behavior across the SWA/full-attention mix.
+Additional required flags found during bring-up: `--max-model-len 16384
+--max-num-seqs 32 --gpu-memory-utilization 0.95 --reasoning-parser mimo
+--tool-call-parser mimo --enable-auto-tool-choice`, and launch with
+`VLLM_API_KEY` unset if the shell profile exports one.
+
+Results:
+
+- Backends: `TRITON_ATTN_DIFFKV` attention, `MarlinMxfp8LinearKernel`
+  for MXFP8 GEMM (qkv_proj + dense MLP), `VLLM_CUTLASS` NVFP4 MoE.
+- Memory: weights ~89 GB/GPU; KV cache 2.95 GiB (24,981 tokens) at
+  0.95 utilization and 16k max len. 0.92 utilization is 0.18 GiB short.
+- Coherence: greedy sanity prompts correct (arithmetic, prose, code).
+- Throughput (steady state): single-stream 116 tok/s; C=4 aggregate
+  ~265-293 tok/s (engine-log cross-checked). Above the sglang stack on
+  the same hardware.
+- Quality spots (temperature 0.6, max-tokens 1024, harness defaults):
+  gsm8k n=20 = 95% (sglang reference 95%), humaneval n=20 = 100%
+  (sglang reference 95%).
+- Fixed during bring-up: FlashInfer CUTLASS MXFP8 kernel was selected
+  when flashinfer could not actually run (no cubins, no nvcc on PATH),
+  crashing in the first compiled forward; its `is_supported` now
+  requires `has_flashinfer()`.
+- Still open from this phase:
+  - Validate long-context needle behavior across the SWA/full-attention
+    mix (needs a longer max-model-len profile).
+  - Try the FlashInfer MXFP8 CUTLASS kernel with `/usr/local/cuda/bin`
+    on PATH (enables JIT) and `flashinfer_b12x` MoE backend; A/B against
+    Marlin/VLLM_CUTLASS.
+  - Larger eval sweeps (n=40+: mmlu, math500, gpqa) vs the sglang
+    references.
 
 ### Phase 2: FP8 KV cache (goal) and FP4 KV cache (stretch)
 
