@@ -15,7 +15,7 @@ from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.utils.math_utils import next_power_of_2
-from vllm.utils.torch_utils import is_quantized_kv_cache
+from vllm.utils.torch_utils import is_quantized_kv_cache, nvfp4_kv_cache_full_dim
 from vllm.v1.attention.backend import AttentionLayer, AttentionType
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionBackend,
@@ -30,7 +30,7 @@ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
 from vllm.v1.attention.ops.triton_unified_attention_diffkv import (
     unified_attention_diffkv,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, KVQuantMode
 
 logger = init_logger(__name__)
 
@@ -71,13 +71,14 @@ class TritonAttentionDiffKVBackend(TritonAttentionBackend):
     # V head dim — set per layer via ``set_head_size_v`` before instantiation.
     head_size_v: int = 128
 
-    # Unquantized and FP8 per-tensor KV caches are supported; per-token-head
-    # quantization modes are not.
+    # Unquantized, FP8 per-tensor, and NVFP4 KV caches are supported;
+    # per-token-head quantization modes are not.
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
         "bfloat16",
         "fp8",
         "fp8_e4m3",
+        "nvfp4",
     ]
 
     @classmethod
@@ -107,12 +108,20 @@ class TritonAttentionDiffKVBackend(TritonAttentionBackend):
         if block_size % 16 != 0:
             raise ValueError("Block size must be a multiple of 16.")
         # Logical (blocks-first, head-major) layout: K and V (with their
-        # different head sizes) packed in the content dim.
+        # different head sizes) packed in the content dim. For NVFP4, each
+        # side packs fp4 data plus inline fp8 block scales.
+        head_size_v = TritonAttentionDiffKVBackend.head_size_v
+        if cache_dtype_str == "nvfp4":
+            content_dim = nvfp4_kv_cache_full_dim(head_size) + nvfp4_kv_cache_full_dim(
+                head_size_v
+            )
+        else:
+            content_dim = head_size + head_size_v
         return (
             num_blocks,
             num_kv_heads,
             block_size,
-            head_size + TritonAttentionDiffKVBackend.head_size_v,
+            content_dim,
         )
 
     @staticmethod
@@ -235,18 +244,26 @@ class TritonAttentionDiffKVImpl(TritonAttentionImpl):
 
         # Triton DiffKV kernels consume (B, N, H, D) cache views.
         kv_cache = kv_cache.transpose(1, 2)
-        key_cache = kv_cache[..., :head_size_qk]
-        value_cache = kv_cache[..., head_size_qk : head_size_qk + head_size_v]
-
-        if is_quantized_kv_cache(self.kv_cache_dtype):
-            if key_cache.dtype != self.fp8_dtype:
-                key_cache = key_cache.view(self.fp8_dtype)
-                value_cache = value_cache.view(self.fp8_dtype)
+        if self._kv_quant_mode == KVQuantMode.NVFP4:
+            # Packed uint8 [K data | K scales | V data | V scales] regions.
+            k_full = nvfp4_kv_cache_full_dim(head_size_qk)
+            v_full = nvfp4_kv_cache_full_dim(head_size_v)
+            key_cache = kv_cache[..., :k_full]
+            value_cache = kv_cache[..., k_full : k_full + v_full]
             k_descale = layer._k_scale
             v_descale = layer._v_scale
         else:
-            k_descale = None
-            v_descale = None
+            key_cache = kv_cache[..., :head_size_qk]
+            value_cache = kv_cache[..., head_size_qk : head_size_qk + head_size_v]
+            if is_quantized_kv_cache(self.kv_cache_dtype):
+                if key_cache.dtype != self.fp8_dtype:
+                    key_cache = key_cache.view(self.fp8_dtype)
+                    value_cache = value_cache.view(self.fp8_dtype)
+                k_descale = layer._k_scale
+                v_descale = layer._v_scale
+            else:
+                k_descale = None
+                v_descale = None
 
         unified_attention_diffkv(
             q=query[:num_actual_tokens],

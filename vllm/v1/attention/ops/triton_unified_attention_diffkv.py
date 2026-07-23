@@ -50,6 +50,55 @@ is_batch_invariant = envs.VLLM_BATCH_INVARIANT
 
 
 @triton.jit
+def _dequant_fp4_nibble(nibble):
+    """Map a 4-bit E2M1 code to its float value.
+
+    Codes: sign bit (bit 3) + 3-bit magnitude index into
+    [0, 0.5, 1, 1.5, 2, 3, 4, 6]. For idx >= 2 the value is
+    2^((idx>>1)-1) * (1 + 0.5*(idx&1)); 0 and 0.5 are specials.
+    """
+    m = (nibble & 0x7).to(tl.int32)
+    mag = tl.where(
+        m == 0,
+        0.0,
+        tl.where(
+            m == 1,
+            0.5,
+            tl.exp2(((m >> 1) - 1).to(tl.float32))
+            * (1.0 + 0.5 * (m & 1).to(tl.float32)),
+        ),
+    )
+    return tl.where((nibble >> 3) & 0x1 == 1, -mag, mag)
+
+
+@triton.jit
+def _load_nvfp4_tile(
+    cache_ptr,
+    token_offset,  # per-(token, head) base offsets in bytes
+    offs_d,  # head-dim offsets, same orientation as token_offset
+    mask,
+    tensor_scale,
+    HEAD_SIZE: tl.constexpr,
+):
+    """Load and dequantize one NVFP4 K or V tile.
+
+    The per-(token, head) region is ``[data | scale]``: ``HEAD_SIZE // 2``
+    bytes of packed E2M1 pairs (dims 2i / 2i+1 as lo / hi nibbles) followed
+    by ``HEAD_SIZE // 16`` fp8-e4m3 block scales. ``tensor_scale`` is the
+    per-tensor checkpoint scale applied on top of the block scales.
+    """
+    data_bytes = tl.load(cache_ptr + token_offset + offs_d // 2, mask=mask, other=0)
+    nibble = tl.where(offs_d % 2 == 1, (data_bytes >> 4) & 0xF, data_bytes & 0xF)
+    sf_u8 = tl.load(
+        cache_ptr + token_offset + HEAD_SIZE // 2 + offs_d // 16,
+        mask=mask,
+        other=0,
+    )
+    sf = sf_u8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+    return _dequant_fp4_nibble(nibble) * sf * tl.load(tensor_scale)
+
+
+@triton.jit
 def kernel_unified_attention_diffkv(
     # Output destinations.  In 2D mode we write the final result into
     # ``output_ptr``; in 3D mode we write per-segment partials into
@@ -200,32 +249,50 @@ def kernel_unified_attention_diffkv(
             block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
         ).to(tl.int64)
 
-        v_offset = (
+        v_base = (
             physical_block_idx[:, None] * stride_v_cache_0
             + kv_head_idx * stride_v_cache_2
-            + offs_d_v[None, :] * stride_v_cache_3
             + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
         )
-        k_offset = (
+        k_base = (
             physical_block_idx[None, :] * stride_k_cache_0
             + kv_head_idx * stride_k_cache_2
-            + offs_d_qk[:, None] * stride_k_cache_3
             + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
         )
-        # K : (HEAD_SIZE_QK_PADDED, TILE_SIZE)
-        K_load = tl.load(
-            key_cache_ptr + k_offset,
-            mask=dim_mask_qk[:, None] & tile_mask[None, :],
-            other=0.0,
-        )
-        K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
-        # V : (TILE_SIZE, HEAD_SIZE_V_PADDED)
-        V_load = tl.load(
-            value_cache_ptr + v_offset,
-            mask=dim_mask_v[None, :] & tile_mask[:, None],
-            other=0.0,
-        )
-        V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
+        if KV_QUANT_MODE == 5:  # KVQuantMode.NVFP4
+            # K : (HEAD_SIZE_QK_PADDED, TILE_SIZE)
+            K = _load_nvfp4_tile(
+                key_cache_ptr,
+                k_base,
+                offs_d_qk[:, None],
+                dim_mask_qk[:, None] & tile_mask[None, :],
+                k_scale,
+                HEAD_SIZE_QK,
+            ).to(Q.dtype)
+            # V : (TILE_SIZE, HEAD_SIZE_V_PADDED)
+            V = _load_nvfp4_tile(
+                value_cache_ptr,
+                v_base,
+                offs_d_v[None, :],
+                dim_mask_v[None, :] & tile_mask[:, None],
+                v_scale,
+                HEAD_SIZE_V,
+            ).to(Q.dtype)
+        else:
+            # K : (HEAD_SIZE_QK_PADDED, TILE_SIZE)
+            K_load = tl.load(
+                key_cache_ptr + k_base + offs_d_qk[:, None] * stride_k_cache_3,
+                mask=dim_mask_qk[:, None] & tile_mask[None, :],
+                other=0.0,
+            )
+            K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
+            # V : (TILE_SIZE, HEAD_SIZE_V_PADDED)
+            V_load = tl.load(
+                value_cache_ptr + v_base + offs_d_v[None, :] * stride_v_cache_3,
+                mask=dim_mask_v[None, :] & tile_mask[:, None],
+                other=0.0,
+            )
+            V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
 
         query_abs_pos = context_len + query_pos[:, None]
         seq_mask = compute_kv_seq_mask(
@@ -415,9 +482,13 @@ def unified_attention_diffkv(
     kv_quant_mode: KVQuantMode = KVQuantMode.NONE,
 ):
     assert causal, "Only causal attention is supported"
-    assert kv_quant_mode in (KVQuantMode.NONE, KVQuantMode.FP8_PER_TENSOR), (
-        f"unified_attention_diffkv only supports unquantized or FP8 "
-        f"per-tensor KV caches, got {kv_quant_mode.name}"
+    assert kv_quant_mode in (
+        KVQuantMode.NONE,
+        KVQuantMode.FP8_PER_TENSOR,
+        KVQuantMode.NVFP4,
+    ), (
+        f"unified_attention_diffkv only supports unquantized, FP8 per-tensor, "
+        f"or NVFP4 KV caches, got {kv_quant_mode.name}"
     )
 
     if sinks is not None:
@@ -431,7 +502,11 @@ def unified_attention_diffkv(
     num_kv_heads = k.shape[2]
     num_queries_per_kv = num_query_heads // num_kv_heads
     head_size_qk = q.shape[2]
-    head_size_v = v.shape[3]
+    if kv_quant_mode == KVQuantMode.NVFP4:
+        # Packed [data | scale] region: full_dim = hv // 2 + hv // 16.
+        head_size_v = v.shape[3] * 16 // 9
+    else:
+        head_size_v = v.shape[3]
 
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)

@@ -538,16 +538,152 @@ def reshape_and_cache_kernel_flash_diffkv(
     return
 
 
+@triton.jit
+def _quant_store_nvfp4_row(
+    src_ptr,
+    src_base,
+    dst_ptr,
+    dst_base,
+    tensor_scale,
+    HEAD_SIZE: tl.constexpr,
+    NG_POW2: tl.constexpr,  # next_power_of_2(HEAD_SIZE // 16)
+):
+    """Quantize one K or V head row to NVFP4 and store it packed.
+
+    Output region layout: ``HEAD_SIZE // 2`` bytes of packed E2M1 pairs
+    (dims 2i / 2i+1 as lo / hi nibbles) followed by ``HEAD_SIZE // 16``
+    fp8-e4m3 block scales (one per 16 elements). Values are divided by
+    ``tensor_scale`` before quantization, so dequantization multiplies the
+    block scale by the same tensor scale.
+    """
+    offs_g = tl.arange(0, NG_POW2)
+    offs_e = tl.arange(0, 16)
+    dims = offs_g[:, None] * 16 + offs_e[None, :]
+    dim_mask = dims < HEAD_SIZE
+    x = tl.load(src_ptr + src_base + dims, mask=dim_mask, other=0.0).to(tl.float32)
+    x = x / tl.load(tensor_scale)
+
+    sf = tl.max(tl.abs(x), axis=1) / 6.0
+    sf_fp8 = sf.to(tl.float8e4nv)
+    sf_dec = sf_fp8.to(tl.float32)
+    q = tl.where(sf_dec[:, None] > 0.0, x / sf_dec[:, None], 0.0)
+
+    # Round-to-nearest E2M1 magnitude code via the midpoints between
+    # representable values [0, 0.5, 1, 1.5, 2, 3, 4, 6].
+    a = tl.abs(q)
+    code = (
+        (a > 0.25).to(tl.int32)
+        + (a > 0.75).to(tl.int32)
+        + (a > 1.25).to(tl.int32)
+        + (a > 1.75).to(tl.int32)
+        + (a > 2.5).to(tl.int32)
+        + (a > 3.5).to(tl.int32)
+        + (a > 5.0).to(tl.int32)
+    )
+    nibble = code | tl.where(q < 0.0, 8, 0)
+
+    shifted = nibble << ((dims % 2) * 4)
+    packed = tl.sum(tl.reshape(shifted, (NG_POW2, 8, 2)), axis=2).to(tl.uint8)
+
+    offs_b = offs_g[:, None] * 8 + tl.arange(0, 8)[None, :]
+    tl.store(dst_ptr + dst_base + offs_b, packed, mask=offs_b < HEAD_SIZE // 2)
+    tl.store(
+        dst_ptr + dst_base + HEAD_SIZE // 2 + offs_g,
+        sf_fp8.to(tl.uint8, bitcast=True),
+        mask=offs_g < HEAD_SIZE // 16,
+    )
+
+
+@triton.jit
+def reshape_and_cache_kernel_flash_diffkv_nvfp4(
+    key_ptr,  # [num_tokens, num_heads, head_size_k]
+    value_ptr,  # [num_tokens, num_heads, head_size_v]
+    # [num_blocks, block_size, num_heads,
+    #  nvfp4_full(head_size_k) + nvfp4_full(head_size_v)] uint8
+    kv_cache_ptr,
+    slot_mapping_ptr,  # [num_tokens]
+    k_scale,  # float32
+    v_scale,  # float32
+    key_stride: tl.int64,
+    value_stride: tl.int64,
+    block_stride: tl.int64,
+    page_stride: tl.int64,
+    head_stride: tl.int64,
+    head_size_k: tl.constexpr,
+    head_size_v: tl.constexpr,
+    block_size: tl.constexpr,
+    NG_K_POW2: tl.constexpr,
+    NG_V_POW2: tl.constexpr,
+):
+    token_idx = tl.program_id(axis=0)
+    slot_idx = tl.load(slot_mapping_ptr + token_idx).to(tl.int64)
+    if slot_idx < 0:
+        # Padding token that should be ignored.
+        return
+
+    head_idx = tl.program_id(axis=1)
+
+    block_idx = slot_idx // block_size
+    block_offset = slot_idx % block_size
+    tgt_base = (
+        block_idx * block_stride + block_offset * page_stride + head_idx * head_stride
+    )
+
+    _quant_store_nvfp4_row(
+        key_ptr,
+        token_idx * key_stride + head_idx * head_size_k,
+        kv_cache_ptr,
+        tgt_base,
+        k_scale,
+        head_size_k,
+        NG_K_POW2,
+    )
+    _quant_store_nvfp4_row(
+        value_ptr,
+        token_idx * value_stride + head_idx * head_size_v,
+        kv_cache_ptr,
+        tgt_base + head_size_k // 2 + head_size_k // 16,
+        v_scale,
+        head_size_v,
+        NG_V_POW2,
+    )
+
+
 def triton_reshape_and_cache_flash_diffkv(
     key: torch.Tensor,  # [num_tokens, num_heads, head_size]
     value: torch.Tensor,  # [num_tokens, num_heads, head_size_v]
-    # Strided [num_blocks, block_size, num_heads, head_size + head_size_v].
+    # Strided [num_blocks, block_size, num_heads, head_size + head_size_v]
+    # (for "nvfp4": [..., nvfp4_full(head_size) + nvfp4_full(head_size_v)]).
     kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,  # [num_tokens]
-    kv_cache_dtype: str,  # "auto", "fp8"
+    kv_cache_dtype: str,  # "auto", "fp8", "nvfp4"
     k_scale: torch.Tensor,  # float32
     v_scale: torch.Tensor,  # float32
 ):
+    if kv_cache_dtype == "nvfp4":
+        num_heads = key.shape[1]
+        head_size_k = key.shape[2]
+        head_size_v = value.shape[2]
+        assert head_size_k % 16 == 0 and head_size_v % 16 == 0
+        reshape_and_cache_kernel_flash_diffkv_nvfp4[(slot_mapping.shape[0], num_heads)](
+            key_ptr=key,
+            value_ptr=value,
+            kv_cache_ptr=kv_cache,
+            slot_mapping_ptr=slot_mapping,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            key_stride=key.stride(0),
+            value_stride=value.stride(0),
+            block_stride=kv_cache.stride(0),
+            page_stride=kv_cache.stride(1),
+            head_stride=kv_cache.stride(2),
+            head_size_k=head_size_k,
+            head_size_v=head_size_v,
+            block_size=kv_cache.shape[1],
+            NG_K_POW2=triton.next_power_of_2(head_size_k // 16),
+            NG_V_POW2=triton.next_power_of_2(head_size_v // 16),
+        )
+        return
     num_heads = key.shape[1]
     head_size_k = key.shape[2]
     head_size_v = value.shape[2]
