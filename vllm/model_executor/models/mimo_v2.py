@@ -361,6 +361,7 @@ class MiMoV2FlashDecoderLayer(nn.Module):
     def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         config = vllm_config.model_config.hf_text_config
+        cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
         layer_id = extract_layer_index(prefix)
 
@@ -389,6 +390,7 @@ class MiMoV2FlashDecoderLayer(nn.Module):
                 layer_id=layer_id,
                 rope_theta=getattr(config, "swa_rope_theta", rope_theta),
                 max_position_embeddings=max_position_embeddings,
+                cache_config=cache_config,
                 quant_config=quant_config,
                 partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
                 prefix=f"{prefix}.self_attn",
@@ -406,6 +408,7 @@ class MiMoV2FlashDecoderLayer(nn.Module):
                 layer_id=layer_id,
                 rope_theta=rope_theta,
                 max_position_embeddings=max_position_embeddings,
+                cache_config=cache_config,
                 quant_config=quant_config,
                 partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
                 prefix=f"{prefix}.self_attn",
