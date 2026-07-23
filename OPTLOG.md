@@ -104,3 +104,21 @@ Decision: KEEP `--moe-backend marlin` in the serve config.
 - Quality: gsm8k n=20 95%; sanity outputs coherent (391/prose/code).
 
 Decision: KEEP.
+
+## Step 5: Kernel tuning sweep — KEEP split policy
+
+Sweep (kernel-level, decode/prefill shapes; stages had no effect):
+
+- 2D grid: tile64/warps8 wins: C1-shape 639->488us, C4-shape
+  322->246us (-24%) vs tile32/warps4.
+- 3D (split-KV decode) grid: tile32/warps4 best (63.9us C1); tile64 or
+  warps8 regress up to +28% there.
+
+Applied: NVFP4 -> 2D tile64/warps8, 3D tile32/warps4. All unit tests
+pass (cos unchanged).
+
+E2E: C=4 330-347 tok/s (unchanged vs step 4 — decode config identical);
+single-stream measured 136-143 tok/s with ~5% boot-to-boot variance
+(within-boot spread <1%); prefill benefits deferred to step 6 numbers.
+
+Decision: KEEP (2D win is real at kernel level; 3D unchanged).
