@@ -35,3 +35,29 @@ Verdict: the dominant cost at both concurrencies is the MoE path
 (GEMM + overheads ~46% at C=1, ~54% at C=4). Attention is a minor
 cost; steps 4/5 (fp4 decode fast path, kernel tuning) are bounded at
 ~1-3% end-to-end. Step 3 (MoE backend A/B) carries the leverage.
+
+## Step 2: SWA KV allocation check — no change needed
+
+Evidence that the hybrid manager gives the 39 SWA layers window-sized
+allocations (fp8 server, pool 17,184 blocks):
+
+- Boot: specs are SlidingWindowSpec(sliding_window=128) (runtime spec
+  dump from the fp8 phase); 6 groups formed (1x9 full + 5 SWA groups,
+  "Add 6 padding layers, may waste at most 15.38%").
+- Runtime: during a 3.5k-token greedy decode, used blocks grew
+  79 -> 190 over 832 -> 3,588 tokens = 0.040 blocks/token, matching the
+  full-attention-only slope (1/32 = 0.031 + bookkeeping). If SWA layers
+  were full-length the slope would be 0.344 blocks/token (8.5x).
+- Absolute usage at 3.6k tokens: 190 blocks vs ~165 theoretical
+  (window-bounded SWA + full growth): ~15% padding overhead, matching
+  the declared padding-layer waste.
+
+The pessimistic boot-time "Maximum concurrency" metric comes from the
+per-request SWA bound min(window + max_num_batched_tokens, max_model_len)
+with the default 16k prefill chunk — a REPORTING/boot-check artifact,
+not an allocation problem. Actionable lever found for step 6: lowering
+--max-num-batched-tokens shrinks that bound and should raise the max
+bootable context materially.
+
+Decision: keep as-is (already optimal); carry the chunk-size lever to
+step 6.
