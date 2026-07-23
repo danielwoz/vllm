@@ -288,27 +288,24 @@ class MiMoV2MTP(nn.Module):
                 name.endswith(".weight_scale_inv")
                 and loaded_weight.dtype == torch.uint8
             ):
-                # ModelOpt MXFP8 stores E8M0 scales as uint8 named
-                # weight_scale_inv; the MXFP8 linear method registers the
-                # parameter as weight_scale.
+                # Map uint8 MXFP8 E8M0 scales to the `weight_scale` parameter
+                # registered by the MXFP8 linear method.
                 name = name.removesuffix("weight_scale_inv") + "weight_scale"
 
             if "qkv_proj" in name:
                 if name.rsplit(".", 1)[0] + ".weight_scale_inv" in params_dict:
-                    # Pro-format block-FP8 checkpoints store the fused qkv
-                    # pre-sharded for TP=8 as [Q_rank0, K_rank0, V_rank0,
-                    # Q_rank1, ...]; chunk(tp_size) gives each rank its
-                    # Q+K+V slice for both the weight and the block
-                    # weight_scale_inv, matching the main model.
+                    # Pro-format block-FP8 stores the fused qkv pre-sharded as
+                    # [Q_rank0, K_rank0, V_rank0, Q_rank1, ...]; chunk(tp_size)
+                    # gives each rank its Q+K+V slice of the weight and the
+                    # block weight_scale_inv.
                     if name in params_dict:
                         param = params_dict[name]
                         loaded_weight = loaded_weight.chunk(tp_size, dim=0)[tp_rank]
                         default_weight_loader(param, loaded_weight)
                         loaded_params.add(name)
                     continue
-                # ModelOpt checkpoints store the fused qkv in plain [Q|K|V]
-                # row order; the standard fused-QKV loader splits and shards
-                # it (and the MXFP8 scale rows) per rank.
+                # Plain [Q|K|V] row order: the standard fused-QKV loader
+                # splits and shards the weight and MXFP8 scale rows per rank.
                 if name in params_dict:
                     param = params_dict[name]
                     weight_loader = getattr(

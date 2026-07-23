@@ -23,8 +23,8 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
     def is_supported(
         cls, compute_capability: int | None = None
     ) -> tuple[bool, str | None]:
-        # The mm_mxfp8 custom op is only registered when has_flashinfer()
-        # holds (package present, plus cubins or nvcc for JIT).
+        # The mm_mxfp8 custom op is only registered when FlashInfer is
+        # available.
         if not has_flashinfer():
             return False, "requires FlashInfer"
         if current_platform.has_device_capability(100):

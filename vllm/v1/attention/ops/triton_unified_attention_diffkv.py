@@ -555,11 +555,8 @@ def unified_attention_diffkv(
     )
 
     # Tile size: 32 for prefill-class kernels.  Decode (small Q) prefers
-    # smaller tiles to expose more parallelism along the KV dim.  The NVFP4
-    # packed loader never uses 16-token tiles (its nibble interleave
-    # miscompiles at 16 rows on triton 3.6); in the 2D path it prefers
-    # 64-token tiles with 8 warps, which amortize the in-register
-    # dequantization across tensor-core-sized loads.
+    # smaller tiles to expose more parallelism along the KV dim.  The
+    # NVFP4 packed loader requires 32-token tiles or larger.
     if kv_quant_mode == KVQuantMode.NVFP4:
         tile_size = 32 if use_3d else 64
         num_warps = 4 if use_3d else 8
