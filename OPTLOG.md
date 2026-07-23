@@ -227,3 +227,17 @@ Same-session A/B on the R2 config:
 EP2 is ~8% slower at both concurrencies (expert load imbalance +
 dispatch overhead over PCIe without NVLink). Decision: DISCARD, stay
 with TP-sharded MoE.
+
+## Step R4: Ngram speculative decoding — DISCARD
+
+--speculative-config '{"method":"ngram","num_speculative_tokens":3,
+"prompt_lookup_max":4,"prompt_lookup_min":2}' on the R2 config:
+
+- Prose: 85.8 single / 264.4 C=4 (baseline 157.5 / 364.8): -46% / -28%.
+- Code-shaped prompt (repetitive class methods, greedy): 134.7 tok/s —
+  still below baseline.
+- Acceptance: mean acceptance length 1.23 (24 accepted / 312 drafted,
+  ~8%) — the model's output is not self-repetitive enough, and each
+  step pays 3 extra verify tokens through a 310B model.
+
+Decision: DISCARD.
