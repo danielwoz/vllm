@@ -72,30 +72,44 @@ def _dequant_fp4_nibble(nibble):
 
 
 @triton.jit
-def _load_nvfp4_tile(
+def _load_nvfp4_rows(
     cache_ptr,
-    token_offset,  # per-(token, head) base offsets in bytes
-    offs_d,  # head-dim offsets, same orientation as token_offset
-    mask,
+    row_base,  # (ROWS, 1) per-(token, head) base offsets in bytes
+    row_mask,  # (ROWS, 1)
     tensor_scale,
+    ROWS: tl.constexpr,
     HEAD_SIZE: tl.constexpr,
+    HEAD_PAD: tl.constexpr,  # next_power_of_2(HEAD_SIZE)
 ):
-    """Load and dequantize one NVFP4 K or V tile.
+    """Load and dequantize NVFP4 rows into a (ROWS, HEAD_PAD) float tile.
 
     The per-(token, head) region is ``[data | scale]``: ``HEAD_SIZE // 2``
     bytes of packed E2M1 pairs (dims 2i / 2i+1 as lo / hi nibbles) followed
-    by ``HEAD_SIZE // 16`` fp8-e4m3 block scales. ``tensor_scale`` is the
-    per-tensor checkpoint scale applied on top of the block scales.
+    by ``HEAD_SIZE // 16`` fp8-e4m3 block scales. Each packed byte and each
+    block scale is loaded once; nibbles are split and re-interleaved into
+    head-dim order in registers. ``tensor_scale`` is the per-tensor
+    checkpoint scale applied on top of the block scales.
     """
-    data_bytes = tl.load(cache_ptr + token_offset + offs_d // 2, mask=mask, other=0)
-    nibble = tl.where(offs_d % 2 == 1, (data_bytes >> 4) & 0xF, data_bytes & 0xF)
+    offs_b = tl.arange(0, HEAD_PAD // 2)
+    data_bytes = tl.load(
+        cache_ptr + row_base + offs_b[None, :],
+        mask=row_mask & (offs_b[None, :] < HEAD_SIZE // 2),
+        other=0,
+    )
+    nibble = tl.interleave(data_bytes & 0xF, (data_bytes >> 4) & 0xF)
+
+    NG_PAD: tl.constexpr = HEAD_PAD // 16
+    offs_g = tl.arange(0, NG_PAD)
     sf_u8 = tl.load(
-        cache_ptr + token_offset + HEAD_SIZE // 2 + offs_d // 16,
-        mask=mask,
+        cache_ptr + row_base + HEAD_SIZE // 2 + offs_g[None, :],
+        mask=row_mask & (offs_g[None, :] < HEAD_SIZE // 16),
         other=0,
     )
     sf = sf_u8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
-    return _dequant_fp4_nibble(nibble) * sf * tl.load(tensor_scale)
+    sf_full = tl.reshape(
+        tl.broadcast_to(sf[:, :, None], (ROWS, NG_PAD, 16)), (ROWS, HEAD_PAD)
+    )
+    return _dequant_fp4_nibble(nibble) * sf_full * tl.load(tensor_scale)
 
 
 @triton.jit
@@ -260,23 +274,32 @@ def kernel_unified_attention_diffkv(
             + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
         )
         if KV_QUANT_MODE == 5:  # KVQuantMode.NVFP4
-            # K : (HEAD_SIZE_QK_PADDED, TILE_SIZE)
-            K = _load_nvfp4_tile(
-                key_cache_ptr,
-                k_base,
-                offs_d_qk[:, None],
-                dim_mask_qk[:, None] & tile_mask[None, :],
-                k_scale,
-                HEAD_SIZE_QK,
+            k_base_rows = (
+                physical_block_idx[:, None] * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_2
+                + (seq_offset % BLOCK_SIZE)[:, None] * stride_k_cache_1
+            )
+            # Rows are token-major; K is transposed after dequantization.
+            K = tl.trans(
+                _load_nvfp4_rows(
+                    key_cache_ptr,
+                    k_base_rows,
+                    tile_mask[:, None],
+                    k_scale,
+                    TILE_SIZE,
+                    HEAD_SIZE_QK,
+                    HEAD_SIZE_QK_PADDED,
+                )
             ).to(Q.dtype)
             # V : (TILE_SIZE, HEAD_SIZE_V_PADDED)
-            V = _load_nvfp4_tile(
+            V = _load_nvfp4_rows(
                 value_cache_ptr,
                 v_base,
-                offs_d_v[None, :],
-                dim_mask_v[None, :] & tile_mask[:, None],
+                tile_mask[:, None],
                 v_scale,
+                TILE_SIZE,
                 HEAD_SIZE_V,
+                HEAD_SIZE_V_PADDED,
             ).to(Q.dtype)
         else:
             # K : (HEAD_SIZE_QK_PADDED, TILE_SIZE)
@@ -532,8 +555,14 @@ def unified_attention_diffkv(
     )
 
     # Tile size: 32 for prefill-class kernels.  Decode (small Q) prefers
-    # smaller tiles to expose more parallelism along the KV dim.
-    tile_size = 32 if not use_3d else (16 if q.element_size() >= 2 else 32)
+    # smaller tiles to expose more parallelism along the KV dim.  The NVFP4
+    # packed loader keeps 32-token tiles everywhere: its nibble interleave
+    # miscompiles at 16-row tiles (triton 3.6) and wider tiles amortize the
+    # in-register dequantization.
+    if kv_quant_mode == KVQuantMode.NVFP4:
+        tile_size = 32
+    else:
+        tile_size = 32 if not use_3d else (16 if q.element_size() >= 2 else 32)
 
     grid: tuple[Any, ...]
     if use_3d:
