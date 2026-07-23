@@ -241,3 +241,29 @@ with TP-sharded MoE.
   step pays 3 extra verify tokens through a 310B model.
 
 Decision: DISCARD.
+
+## Step R5: MTP draft debug — FIXED, KEEP (k=1)
+
+Root cause of zero acceptance: the MTP loader chunked the ModelOpt
+fused qkv_proj as Pro-format TP-interleaved (scrambling Q/K/V rows) AND
+silently dropped the uint8 MXFP8 weight_scale_inv (param is
+weight_scale) leaving the scale uninitialized. Draft logits were
+garbage; rejection sampling rejected everything.
+
+Diagnosis path: structural diff vs the sglang nextn reference (norms +
+eh_proj concat order matched), then a pre-final-norm hidden-state
+side-channel experiment (no effect: acceptance identical with pre- and
+post-norm hidden, so the side-channel was reverted), then the loader
+audit found the qkv bug — the same bug class as the target-model fix
+earlier in this branch.
+
+| config                  | single | C=4   | accept len |
+|-------------------------|--------|-------|------------|
+| no spec (R2 keeper)     | 157.5  | 364.8 | -          |
+| MTP k=1                 | 174.4  | 412.9 | 1.78       |
+| MTP k=2                 | 176.7  | 346.1 | 2.18       |
+
+k=1 wins overall (k=2 verify cost hurts batch). Quality on keeper:
+gsm8k n=20 100%, humaneval n=20 100%.
+
+Decision: KEEP MTP k=1 in the serve config.
