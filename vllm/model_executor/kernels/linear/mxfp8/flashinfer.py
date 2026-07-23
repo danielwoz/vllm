@@ -11,7 +11,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.utils import flashinfer as vllm_flashinfer
-from vllm.utils.flashinfer import has_flashinfer_cutedsl
+from vllm.utils.flashinfer import has_flashinfer, has_flashinfer_cutedsl
 
 from .Mxfp8LinearKernel import Mxfp8LinearKernel, Mxfp8LinearLayerConfig
 
@@ -23,6 +23,10 @@ class FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearKernel):
     def is_supported(
         cls, compute_capability: int | None = None
     ) -> tuple[bool, str | None]:
+        # The mm_mxfp8 custom op is only registered when has_flashinfer()
+        # holds (package present, plus cubins or nvcc for JIT).
+        if not has_flashinfer():
+            return False, "requires FlashInfer"
         if current_platform.has_device_capability(100):
             return True, None
         return False, "requires >=sm_100 (Blackwell)"
