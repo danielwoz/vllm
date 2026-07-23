@@ -170,3 +170,24 @@ NVFP4 decode kernel with split tile policy.
 | C=4 tok/s           | 211.5          | 330-347 (+56-64%) |
 | max bootable ctx    | 128k (prev phase) | 1,048,576 (native max) |
 | needle              | 55k exact      | 405,059 tokens exact |
+
+# Round 2
+
+## Step R1: Re-profile keeper config (nvfp4 KV + marlin MoE + tuned kernel)
+
+C=1 window 2.095s (round-1: 2.62s), C=4 window 3.33s (was 3.92s):
+
+| Kernel group                          | C=1    | C=4    |
+|---------------------------------------|--------|--------|
+| marlin_moe_wna16 (NVFP4 experts)      | 30.4%  | 46.5%  |
+| bf16 dense GEMV/GEMM (o_proj+lm_head) | 25.5%  | 23.1%  |
+| Marlin MXFP8 (qkv + dense MLP)        | 16.8%  | 10.3%  |
+| TP2 allreduce (custom 1-stage)        |  8.6%  |  7.2%  |
+| aten::mm (routers etc.)               |  5.6%  |  3.5%  |
+| DiffKV attention stack                |  6.0%  | ~4.0%  |
+| MoE routing overhead                  | ~4%    | ~2%    |
+
+vs round 1: cutlass MoE act-quant/blockscale overhead is gone (marlin),
+MoE GEMM absolute time -21% at C=1; attention share stays small.
+Ranking confirms plan order: bf16 stragglers (R2) > EP A/B (R3) >
+allreduce probe (R6). No reordering needed.
