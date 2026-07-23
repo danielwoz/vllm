@@ -122,3 +122,19 @@ single-stream measured 136-143 tok/s with ~5% boot-to-boot variance
 (within-boot spread <1%); prefill benefits deferred to step 6 numbers.
 
 Decision: KEEP (2D win is real at kernel level; 3D unchanged).
+
+## Step 6: Context push — native 1M context boots
+
+Lever from step 2 (--max-num-batched-tokens 8192 shrinks the
+per-request SWA boot estimate) + nvfp4 KV + marlin MoE:
+
+| max-model-len | pool tokens | concurrency | note |
+|---------------|-------------|-------------|------|
+| 262,144       | 806,470     | 3.08x       | needle EXACT @ 207,059 tok (160s, ~1.3k tok/s prefill) |
+| 524,288       | 1,003,541   | 1.91x       | needle EXACT @ 405,059 tok (577s, ~700 tok/s) |
+| 786,432       | 1,121,011   | 1.43x       | boot probe |
+| 1,048,576     | 1,174,682   | 1.12x       | NATIVE MAX — boots, sanity coherent |
+
+(bf16 KV baseline could not even boot 32k at 0.95 utilization.)
+Follow-up: 1M-range needle (~25 min prefill) not run; 405k retrieval
+was exact.
