@@ -303,3 +303,24 @@ Final recommended serve command:
 (reasoning/tool parsers: --reasoning-parser mimo --tool-call-parser
 mimo --enable-auto-tool-choice; VLLM_API_KEY must be unset or the
 harness needs auth headers.)
+
+# Follow-ups package
+
+## Step F1: 1M-range needle — EXACT
+
+Config: final keeper (nvfp4 KV, marlin MoE, online-fp8 stragglers,
+MTP k=1) + max-model-len 1,048,576 + batched-tokens 8192. Pool:
+1,411,333 tokens, 1.35x concurrency.
+
+- Needle at ~950k depth in a 1,010,059-token prompt: retrieved EXACT
+  ('ZEBRA-7742').
+- Prefill: 3,640s (~61 min) end-to-end, ~278 tok/s average (quadratic
+  full-attention dominated at depth; chunked at 8192).
+- Decode at 1M depth (prefix-cache probe, 200 tokens): ~2.9 tok/s —
+  slow but correct and coherent; deep-decode split-KV tuning noted as
+  future work.
+- GPU memory during run: 93,646 / 97,887 MiB per GPU (~4.2 GiB
+  headroom), flat for the whole hour — no OOM pressure.
+
+The 1M claim is now complete: boots, retrieves exactly at 950k+ depth,
+stable memory.
