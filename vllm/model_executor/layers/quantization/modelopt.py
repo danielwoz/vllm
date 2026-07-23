@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from fnmatch import fnmatch
 from typing import TYPE_CHECKING, Any, cast
 
@@ -2303,6 +2304,44 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         self.nvfp4_config = nvfp4_config
         self.w4a16_nvfp4_config = w4a16_nvfp4_config
         self.mxfp8_config = mxfp8_config
+        # Optional online FP8 quantization for modules the checkpoint left
+        # unquantized (comma-separated module suffixes, e.g.
+        # "o_proj,lm_head"). Weights are loaded in the checkpoint dtype and
+        # quantized to per-tensor FP8 with dynamic activation scales.
+        online = os.environ.get("VLLM_MODELOPT_MIXED_ONLINE_FP8", "")
+        self.online_fp8_suffixes = {
+            suffix.strip() for suffix in online.split(",") if suffix.strip()
+        }
+        if self.online_fp8_suffixes:
+            from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+
+            self.online_fp8_config = Fp8Config(is_checkpoint_fp8_serialized=False)
+        else:
+            self.online_fp8_config = None
+        if self.online_fp8_suffixes:
+            logger.info_once(
+                "ModelOpt mixed-precision: online FP8 for unquantized "
+                "modules matching %s",
+                ",".join(sorted(self.online_fp8_suffixes)),
+            )
+
+    def _online_fp8_method(
+        self, layer: torch.nn.Module, prefix: str
+    ) -> "QuantizeMethodBase | None":
+        if self.online_fp8_config is None:
+            return None
+        if prefix.rsplit(".", 1)[-1] not in self.online_fp8_suffixes:
+            return None
+        from vllm.model_executor.layers.quantization.online.fp8 import (
+            Fp8PerTensorOnlineLinearMethod,
+        )
+        from vllm.model_executor.layers.quantization.utils.marlin_utils import (
+            get_marlin_input_dtype as _marlin_input_dtype,
+        )
+
+        method = Fp8PerTensorOnlineLinearMethod()
+        method.marlin_input_dtype = _marlin_input_dtype(prefix)
+        return method
 
     def get_name(self) -> QuantizationMethods:
         return "modelopt_mixed"
@@ -2518,6 +2557,8 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         # Excluded layers
         if self.is_layer_excluded(prefix):
             if isinstance(layer, (LinearBase, ParallelLMHead)):
+                if (method := self._online_fp8_method(layer, prefix)) is not None:
+                    return method
                 return UnquantizedLinearMethod()
             return None
 
@@ -2532,7 +2573,10 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
                 return ModelOptNvFp4W4A16LinearMethod(self.w4a16_nvfp4_config)
             if quant_algo == "MXFP8":
                 return ModelOptMxFp8LinearMethod(self.mxfp8_config)
-            # Layer not in quantized_layers — leave unquantized
+            # Layer not in quantized_layers — leave unquantized unless
+            # online FP8 was requested for this module suffix.
+            if (method := self._online_fp8_method(layer, prefix)) is not None:
+                return method
             return UnquantizedLinearMethod()
 
         if isinstance(layer, RoutedExperts):
