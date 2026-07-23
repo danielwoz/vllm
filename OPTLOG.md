@@ -341,3 +341,26 @@ Overall: 3 benches above reference, 1 equal, 1 below within noise —
 MTP speculative decoding preserves quality at scale, and the full
 optimized stack (nvfp4 KV + marlin MoE + online-fp8 stragglers + MTP)
 matches or beats the sglang reference.
+
+## Step F3: Multimodal omni bring-up — WORKS (no code changes needed)
+
+Dropped the text-only hf-overrides; arch resolved to
+MiMoV2OmniForCausalLM and booted first try on the optimized stack
+(nvfp4 KV + marlin MoE; online-fp8 env and MTP left OFF, see caveats).
+
+- Text: coherent (391 / prose / code) through the omni model.
+- Vision: PIL-rendered red circle + tiny "HELLO VLLM" caption ->
+  described the circle, outline color, AND read the text exactly.
+  Second probe: green rectangle described as "green square with black
+  border" (aspect-ratio imprecision, pipeline correct).
+- Audio: 440 Hz sine WAV -> "a continuous, high-pitched beep or tone".
+  Required installing librosa/soundfile/av/resampy (vllm[audio]);
+  first attempts failed 500 with a clear install message.
+
+Caveats / remaining for full MM validation:
+- VLLM_MODELOPT_MIXED_ONLINE_FP8='o_proj' must NOT be combined with
+  omni yet: the suffix also matches the audio tower's o_proj layers
+  (excluded/bf16 in the checkpoint). Needs path-scoped patterns.
+- MTP with omni untested (MiMoV2OmniMTPModel is registered).
+- Untested surface: real photos, multi-image, video, video_audio
+  processor path, speech content, MM benchmarks.

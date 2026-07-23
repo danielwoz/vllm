@@ -226,7 +226,16 @@ Effort estimate: comparable to the fp8 step plus the two kernel
 branches; quality risk is higher (4-bit V), so gate on needle tests and
 a full eval sweep vs fp8.
 
-### Phase 3: Multimodal (omni)
+### Phase 3: Multimodal (omni) — bring-up VALIDATED (2026-07-24)
+
+MiMoV2OmniForCausalLM boots on the optimized serve config with zero
+code changes (the loader fixes from bring-up cover the omni text core).
+Text/image/audio all verified working (see OPTLOG Step F3); audio needs
+the vllm[audio] extras installed. Remaining: path-scoped online-fp8
+patterns before combining with the fp8-straggler opt-in, MTP-with-omni,
+and a real MM eval sweep.
+
+### Phase 3 original notes
 
 - Drop the `--hf-overrides` nulling and exercise
   `MiMoV2OmniForCausalLM` (vision tower + audio encoder are BF16 and
