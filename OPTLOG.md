@@ -61,3 +61,26 @@ bootable context materially.
 
 Decision: keep as-is (already optimal); carry the chunk-size lever to
 step 6.
+
+## Step 3: NVFP4 MoE backend A/B — KEEP --moe-backend marlin
+
+Same-session bench (nvfp4 KV, 16k, TP2), warmed, 500-tok gens:
+
+| MoE backend        | single tok/s | C=4 tok/s | notes |
+|--------------------|--------------|-----------|-------|
+| VLLM_CUTLASS (auto)| 114.2        | 211.5     | baseline; W4A4 + act-quant overhead |
+| MARLIN             | 141.5 (+24%) | 240.4 (+14%) | W4A16; winner |
+| FLASHINFER_CUTLASS | 135.5 (+19%) | 236.1 (+12%) | needs nvcc on PATH (JIT) |
+| FLASHINFER_B12X    | boot FAIL    | -         | torch stable-ABI dispatch error in flashinfer prebuilt module |
+
+- Also tried FlashInfer CUTLASS MXFP8 linear kernel (nvcc on PATH) atop
+  marlin MoE: boot FAIL — "'QKVParallelLinear' object has no attribute
+  'workspace'" in the flashinfer MXFP8 path. Separate upstream bug;
+  discarded (Marlin MXFP8 stays).
+- Quality on marlin MoE: gsm8k n=20 100%, humaneval n=20 90% (within
+  the 90-100% band seen across all backends at n=20, temp 0.6).
+- Matches profiling: marlin removes the fp4 activation-quant +
+  blockscale bookkeeping (~15% of C=1 time) and its W4A16 GEMV is
+  stronger at decode batch sizes.
+
+Decision: KEEP `--moe-backend marlin` in the serve config.
