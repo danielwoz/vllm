@@ -267,3 +267,39 @@ k=1 wins overall (k=2 verify cost hurts batch). Quality on keeper:
 gsm8k n=20 100%, humaneval n=20 100%.
 
 Decision: KEEP MTP k=1 in the serve config.
+
+## Step R6: Bounded probes
+
+- FA4 on SM12x: conclusively unavailable — vllm_flash_attn ships only
+  FA2/FA3 binaries and gates FA4 to cc 9.x/10.x/11.x. FLASH_ATTN_DIFFKV
+  stays out of reach on these GPUs until upstream FA4 adds sm120.
+- Cudagraph mode: already FULL_AND_PIECEWISE (v1 default) in the
+  running config; nothing to change.
+- Allreduce A/B: --disable-custom-all-reduce (NCCL ring) = 164.2 /
+  383.6 vs custom 1-stage 174.4 / 412.9 -> custom wins ~6-7%. DISCARD.
+
+## Round 2 totals + FINAL SERVE CONFIG
+
+| Metric   | round-2 start | round-2 end |
+|----------|---------------|-------------|
+| single   | 136-143       | 174.4 (+~25%) |
+| C=4      | 330-347       | 412.9 (+~22%) |
+
+Campaign total (both rounds): 114.2 -> 174.4 single (+53%),
+211.5 -> 412.9 C=4 (+95%). Quality at every gate: gsm8k/humaneval
+n=20 95-100%.
+
+Final recommended serve command:
+
+  VLLM_MODELOPT_MIXED_ONLINE_FP8='o_proj,lm_head' \
+  vllm serve lukealonso/MiMo-V2.5-NVFP4 \
+    --tensor-parallel-size 2 \
+    --hf-overrides '{"vision_config": null, "audio_config": null}' \
+    --kv-cache-dtype nvfp4 --moe-backend marlin \
+    --speculative-config '{"method": "mimo_v2_mtp", "num_speculative_tokens": 1}' \
+    --gpu-memory-utilization 0.95 --max-num-seqs 32 \
+    --max-model-len 16384          # up to 1048576 with --max-num-batched-tokens 8192
+
+(reasoning/tool parsers: --reasoning-parser mimo --tool-call-parser
+mimo --enable-auto-tool-choice; VLLM_API_KEY must be unset or the
+harness needs auth headers.)
