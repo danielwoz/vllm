@@ -138,3 +138,35 @@ per-request SWA boot estimate) + nvfp4 KV + marlin MoE:
 (bf16 KV baseline could not even boot 32k at 0.95 utilization.)
 Follow-up: 1M-range needle (~25 min prefill) not run; 405k retrieval
 was exact.
+
+## Step 7: MTP spec-decode — bring-up done, DISCARD from serve config
+
+- Fixed the cache_config gap in mimo_v2_mtp.py (committed; correctness
+  fix regardless of spec-decode use).
+- Boots with --speculative-config '{"method": "mimo_v2_mtp",
+  "num_speculative_tokens": 1}' (draft MiMoV2MTPModel resolves, loads
+  the model.mtp.* weights, output stays coherent).
+- Measured: mean acceptance length 1.00 — ZERO accepted tokens over
+  5,252 drafts. Throughput with MTP: 92.9 single / 230.9 C=4 vs
+  ~140 / 330-347 without — pure draft overhead, no acceptances.
+- Verdict: the draft predicts tokens the target never accepts, which
+  indicates a draft-side correctness bug (hidden-state plumbing, norm
+  order, or draft attention path), not just a weak draft. Needs
+  dedicated debugging beyond this campaign; sglang's EAGLE gained
+  ~nothing on real text even when working, so upside is capped anyway.
+
+Decision: DISCARD spec-decode from the serve config; keep the
+cache_config fix; open item documented for a future phase.
+
+## Campaign summary
+
+Final keeper config: TP2, --kv-cache-dtype nvfp4, --moe-backend marlin,
+--max-num-batched-tokens 8192 (for long-context serves), single-pass
+NVFP4 decode kernel with split tile policy.
+
+| Metric              | campaign start | final |
+|---------------------|----------------|-------|
+| single-stream tok/s | 114.2          | 136-143 (+20-25%) |
+| C=4 tok/s           | 211.5          | 330-347 (+56-64%) |
+| max bootable ctx    | 128k (prev phase) | 1,048,576 (native max) |
+| needle              | 55k exact      | 405,059 tokens exact |
