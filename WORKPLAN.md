@@ -168,7 +168,34 @@ Results:
 - Still open: FA4-on-SM12x investigation for `FLASH_ATTN_DIFFKV`
   remains a possible perf upgrade over the triton path.
 
-### Phase 2b: NVFP4 KV cache (stretch — assessment)
+### Phase 2b: NVFP4 KV cache — DONE (2026-07-23)
+
+`--kv-cache-dtype nvfp4` works with `TRITON_ATTN_DIFFKV`. Layout per
+(token, head, side): E2M1 data (2 dims/byte) + inline fp8-e4m3 block
+scales (1 per 16 dims), matching the FlashInfer NVFP4 KV conventions
+(`nvfp4_kv_cache_full_dim`); content dim 108+72 = 180 bytes vs 320
+(fp8) / 640 (bf16).
+
+Results (2x PRO 6000, TP2, runtime spec dump confirmed
+`uint8 / KVQuantMode.NVFP4`):
+
+- GPU unit test: store+read round trip vs bf16, cosine 0.991-0.992
+  (windowed + non-unit tensor scales; ~4x the fp8 error, as expected
+  for 4-bit).
+- Capacity: 89,180 tokens at 16k max len (3.57x bf16, 1.78x fp8 —
+  exactly the 640:320:180 byte ratio). New context ceiling: 64k boots
+  at 4.25x concurrency (278,780 tokens), 128k boots at 3.31x
+  (433,976 tokens). bf16 could not hold 32k.
+- Coherence pass (391 / prose / code, also at the 128k config); needle
+  recall exact at 13.5k and 55.5k tokens.
+- Throughput: 113 tok/s single-stream (-2.5% vs bf16/fp8), 231 tok/s
+  at C=4 (-12% vs fp8) — in-register nibble decode cost.
+- Quality: gsm8k n=20 95%, humaneval n=20 100%, math500 n=20 50% at
+  max-tokens 1024 but 70% at 2048 (above the sglang n=40 reference of
+  65%) — the low first reading was token-budget truncation, not fp4
+  degradation.
+
+### Phase 2b original assessment (for reference)
 
 Groundwork already in vLLM: `KVQuantMode.NVFP4` exists,
 `AttentionSpec.real_page_size_bytes` / the DiffKV spec compute packed
@@ -213,6 +240,25 @@ a full eval sweep vs fp8.
   (`model.mtp.layers.{0,1,2}`, MXFP8 qkv/MLP). Wire up
   `--speculative-config` for `mimo_v2_mtp`, confirm the draft loader
   consumes the `model.mtp.*` weights the target model skips.
+
+## Upstream PR series (proposed order)
+
+1. `[Model] Register MiMoV2Config for mimo_v2 checkpoints` — standalone,
+   unblocks all mimo_v2 checkpoints without remote code.
+2. `[Bugfix] Pass cache_config to MiMo-V2 attention layers` — standalone
+   correctness fix (kv-cache dtype silently ignored); small and easy to
+   review; could be squashed with (1) into one MiMo-V2 fixes PR.
+3. `[Model] Load ModelOpt MXFP8 fused qkv_proj in MiMo-V2` +
+   `[Kernel] Gate FlashInfer CUTLASS MXFP8 kernel on FlashInfer
+   availability` — one PR: makes the NVFP4/MXFP8 checkpoint load and run
+   (the kernel gating fix is what its bring-up exposed).
+4. `[Attention] Support FP8 per-tensor KV cache in Triton DiffKV
+   backend` — one PR with unit tests ported from the bring-up scripts
+   (tests/kernels/attention).
+5. `[Attention] Support NVFP4 KV cache in Triton DiffKV backend` —
+   follow-up PR on (4), same test harness extended.
+- Not for upstream as-is: the offline validation tool (reshape into a
+  weight-loading test) and the WORKPLAN itself.
 
 ## Upstream PR notes
 
