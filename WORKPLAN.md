@@ -140,22 +140,64 @@ Results:
   - Larger eval sweeps (n=40+: mmlu, math500, gpqa) vs the sglang
     references.
 
-### Phase 2: FP8 KV cache (goal) and FP4 KV cache (stretch)
+### Phase 2: FP8 KV cache — DONE (2026-07-23)
 
-- Gap: `TRITON_ATTN_DIFFKV` currently allows only `auto`/`bfloat16` KV
-  (`supported_kv_cache_dtypes`); `--kv-cache-dtype fp8_e4m3` will be
-  rejected on SM120. Options, in order of preference:
-  1. Extend the DiffKV triton kernels to fp8 KV (the parent
-     `TRITON_ATTN` already supports fp8; the diffkv variant only changes
-     K/V packing in the content dim, so this is mostly plumbing scale
-     handling through the packed layout).
-  2. Investigate FA4 on SM12x for `FLASH_ATTN_DIFFKV` (fa_utils
-     currently restricts FA4 to capability major 10).
-- FP4 KV: no generic fp4 KV path exists in vLLM. A DiffKV fp4 cache
-  would need a packed 4-bit content dim + per-block scales and
-  quant/dequant in the triton kernels, mirroring the earlier
-  DeepSeek sparse-MLA NVFP4-KV port (~/vllm-nvfp4-port). Document-only
-  for now; do not block bring-up on it.
+`--kv-cache-dtype fp8_e4m3` now works with `TRITON_ATTN_DIFFKV`.
+
+- Root-caused and fixed a silent pre-existing bug first:
+  `MiMoV2FlashDecoderLayer` never passed `cache_config` into its
+  attention layers, so any `--kv-cache-dtype` was ignored (specs stayed
+  bf16/KVQuantMode.NONE while the engine banner claimed fp8).
+- DiffKV read side extended for FP8 per-tensor KV: `KV_QUANT_MODE`
+  constexpr + per-tensor descales in `kernel_unified_attention_diffkv`
+  (shared `_cast_kv_tile` dequant); impl views the packed cache as fp8
+  and passes `layer._k_scale`/`_v_scale`; query quantization disabled
+  (kernel dequantizes K/V against the bf16 query). The store kernel
+  (`reshape_and_cache_flash_diffkv`) already handled fp8.
+- Validation on the 2x PRO 6000 (TP2):
+  - GPU unit test: fp8 vs bf16 kernel outputs cosine 0.9994 (2D + 3D
+    paths, sliding window, non-unit descale).
+  - KV capacity doubled: 24,981 -> 49,965 tokens at 16k max len
+    (concurrency 1.52x -> 3.05x); 32k max len boots with 91,018 tokens
+    (2.78x) — bf16 could not hold 32k at 0.95 utilization.
+  - Coherence (greedy 391/prose/code) and 13.5k-token needle recall
+    pass; gsm8k n=20 95%, humaneval n=20 95% (bf16: 95%/100%; one
+    sample at n=20 is within temperature-0.6 noise).
+  - Throughput parity with bf16: 116 tok/s single-stream, ~261 tok/s
+    at C=4.
+- Still open: FA4-on-SM12x investigation for `FLASH_ATTN_DIFFKV`
+  remains a possible perf upgrade over the triton path.
+
+### Phase 2b: NVFP4 KV cache (stretch — assessment)
+
+Groundwork already in vLLM: `KVQuantMode.NVFP4` exists,
+`AttentionSpec.real_page_size_bytes` / the DiffKV spec compute packed
+fp4 page sizes via `nvfp4_kv_cache_full_dim` (fp4 data + inline fp8
+block scales), and `CacheDType` accepts "nvfp4" (used by the
+non-DiffKV nvfp4 path). Remaining work for DiffKV:
+
+1. Store: add an NVFP4 branch to `reshape_and_cache_flash_diffkv`
+   (per-16-element group amax -> block scale, pack two E2M1 nibbles per
+   byte, write scales inline after the packed data).
+2. Load: add a `KV_QUANT_MODE == NVFP4` branch to
+   `kernel_unified_attention_diffkv`: load packed bytes + block scales,
+   branchless E2M1 nibble decode, dequant per 16-element group. The
+   proven portable math (nibble LUT `_dequant_fp4_nibble`, lo/hi nibble
+   indexing `byte d//2`, uint8 exponent scales per 16 dims) exists in
+   the working sglang-side kernel
+   (~/mimo-v25-sglang/patches/extend_attention.py) and in the earlier
+   DeepSeek sparse-MLA NVFP4-KV port (~/vllm-nvfp4-port).
+3. Layout: `TritonAttentionDiffKVBackend.get_kv_cache_shape` must
+   switch the content dim to
+   `nvfp4_kv_cache_full_dim(head_size) + nvfp4_kv_cache_full_dim(head_size_v)`
+   and the impl's K/V view slicing must follow the packed offsets;
+   match the existing non-DiffKV nvfp4 backend's inline-scale layout.
+4. Gating: advertise "nvfp4" in `supported_kv_cache_dtypes` and reject
+   it for backends without the branch.
+
+Effort estimate: comparable to the fp8 step plus the two kernel
+branches; quality risk is higher (4-bit V), so gate on needle tests and
+a full eval sweep vs fp8.
 
 ### Phase 3: Multimodal (omni)
 
