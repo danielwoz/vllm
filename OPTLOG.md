@@ -191,3 +191,26 @@ vs round 1: cutlass MoE act-quant/blockscale overhead is gone (marlin),
 MoE GEMM absolute time -21% at C=1; attention share stays small.
 Ranking confirms plan order: bf16 stragglers (R2) > EP A/B (R3) >
 allreduce probe (R6). No reordering needed.
+
+## Step R2: Online FP8 for bf16 stragglers (o_proj + lm_head) — KEEP
+
+Added opt-in env VLLM_MODELOPT_MIXED_ONLINE_FP8 to the ModelOpt
+mixed-precision config: listed module suffixes route to
+Fp8PerTensorOnlineLinearMethod (online per-tensor weight quant, dynamic
+activation scales) instead of staying unquantized.
+
+Pitfall hit first: instantiating Fp8LinearMethod directly with a
+non-serialized config produced '!' garbage output (rotten legacy path);
+the supported route is Fp8PerTensorOnlineLinearMethod (meta-device
+deferred load + quantize-on-load), which works with MiMo-V2's loader.
+
+| config                  | single | C=4   |
+|-------------------------|--------|-------|
+| baseline (keeper)       | 136-143| 330-347|
+| o_proj online fp8       | 153.1  | 352.7 |
+| o_proj + lm_head        | 157.5  | 364.8 |
+
+Quality gate: gsm8k n=20 100%, humaneval n=20 100%; prose/code
+coherent. Decision: KEEP 'o_proj,lm_head'.
+(Upstream note: promote the env opt-in to a proper quantization
+override config before PR.)
