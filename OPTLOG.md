@@ -84,3 +84,23 @@ Same-session bench (nvfp4 KV, 16k, TP2), warmed, 500-tok gens:
   stronger at decode batch sizes.
 
 Decision: KEEP `--moe-backend marlin` in the serve config.
+
+## Step 4: FP4 decode fast path — KEEP (single-pass loads; PTX cvt blocked)
+
+- Native PTX path FAILED: `cvt.rn.f16x2.e2m1x2` assembles for sm_120a
+  but the low fp16 lane always returns 0 (hi lane correct; byte staging
+  verified by round-trip). Looks like a ptxas-blackwell/triton-3.6
+  bundle bug; documented and abandoned.
+- Fallback implemented: single-pass tile loads (each packed byte loaded
+  once, both nibbles decoded, tl.interleave into head-dim order; block
+  scales loaded once per 16 dims and broadcast). K built token-major
+  then transposed.
+- Found + fixed en route: tl.interleave miscompiles at 16-row tiles
+  (3D decode path produced garbage; caught by extending unit tests to
+  the 3D and prefill shapes after e2e gibberish). NVFP4 now pins
+  32-token tiles in the 3D path.
+- Kernel microbench (8x4k decode): 546us -> 322us (-41%).
+- E2E: single 143.0 (vs 141.5, +1%), C=4 333-347 (vs 240.4, +39%).
+- Quality: gsm8k n=20 95%; sanity outputs coherent (391/prose/code).
+
+Decision: KEEP.
