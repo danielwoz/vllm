@@ -214,3 +214,16 @@ Quality gate: gsm8k n=20 100%, humaneval n=20 100%; prose/code
 coherent. Decision: KEEP 'o_proj,lm_head'.
 (Upstream note: promote the env opt-in to a proper quantization
 override config before PR.)
+
+## Step R3: Expert-parallel A/B — DISCARD
+
+Same-session A/B on the R2 config:
+
+| MoE sharding      | single | C=4   |
+|-------------------|--------|-------|
+| TP2 (baseline)    | 157.5  | 364.8 |
+| EP2 (--enable-expert-parallel) | 144.5 | 335.0 |
+
+EP2 is ~8% slower at both concurrencies (expert load imbalance +
+dispatch overhead over PCIe without NVLink). Decision: DISCARD, stay
+with TP-sharded MoE.
