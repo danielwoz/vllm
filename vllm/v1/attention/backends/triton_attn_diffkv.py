@@ -44,6 +44,12 @@ class TritonAttentionDiffKVMetadataBuilder(TritonAttentionMetadataBuilder):
     re-allocate with ``next_power_of_2(head_size_v)`` instead.
     """
 
+    # Split-KV segment count for the DiffKV decode path. MiMo-class models
+    # have very few KV heads per rank (e.g. 2), so the 3D grid needs many
+    # segments to fill the GPU at long context; 128 is fastest from 16k to
+    # 1M-token depths on SM120 and costs only larger reduction buffers.
+    NUM_PAR_SOFTMAX_SEGMENTS_DIFFKV = 128
+
     def __init__(
         self,
         kv_cache_spec: AttentionSpec,
@@ -53,6 +59,7 @@ class TritonAttentionDiffKVMetadataBuilder(TritonAttentionMetadataBuilder):
     ):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
 
+        self.num_par_softmax_segments = self.NUM_PAR_SOFTMAX_SEGMENTS_DIFFKV
         head_size_v = TritonAttentionDiffKVBackend.head_size_v
         head_size_v_padded = next_power_of_2(head_size_v)
         self.softmax_segm_output = torch.empty(
@@ -62,6 +69,16 @@ class TritonAttentionDiffKVMetadataBuilder(TritonAttentionMetadataBuilder):
                 self.num_par_softmax_segments,
                 head_size_v_padded,
             ),
+            dtype=torch.float32,
+            device=device,
+        )
+        self.softmax_segm_max = torch.empty(
+            (self.seq_threshold_3D, self.num_heads_q, self.num_par_softmax_segments),
+            dtype=torch.float32,
+            device=device,
+        )
+        self.softmax_segm_expsum = torch.empty(
+            (self.seq_threshold_3D, self.num_heads_q, self.num_par_softmax_segments),
             dtype=torch.float32,
             device=device,
         )

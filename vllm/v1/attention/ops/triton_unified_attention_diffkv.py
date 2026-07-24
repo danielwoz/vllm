@@ -540,17 +540,20 @@ def unified_attention_diffkv(
 
     sliding_window_val = 1 + window_size[0] if window_size[0] >= 0 else 0
 
-    # Decide between 2D and 3D launch.  Mirrors the standard launcher:
-    # 3D requires preallocated softmax buffers, decode-only batches, and
-    # a small number of sequences (otherwise 2D already saturates the SM).
+    # Decide between 2D and 3D launch.  Mirrors the standard launcher, but
+    # also admits short multi-token decode queries (speculative-decode
+    # verification, q_len <= 2): in 2D a single program walks the whole KV
+    # sequence, which collapses at long context with few KV heads.  The
+    # per-segment buffers are indexed per query token, so the token count
+    # (not the sequence count) must fit the preallocated rows.
     use_3d = not (
         seq_threshold_3D is None
         or num_par_softmax_segments is None
         or softmax_segm_output is None
         or softmax_segm_max is None
         or softmax_segm_expsum is None
-        or max_seqlen_q > 1
-        or num_seqs > seq_threshold_3D
+        or max_seqlen_q > 2
+        or q.shape[0] > seq_threshold_3D
         or is_batch_invariant
     )
 
