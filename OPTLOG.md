@@ -364,3 +364,34 @@ Caveats / remaining for full MM validation:
 - MTP with omni untested (MiMoV2OmniMTPModel is registered).
 - Untested surface: real photos, multi-image, video, video_audio
   processor path, speech content, MM benchmarks.
+
+## Segment-count hypothesis test (user-directed) — CONFIRMED + amplified, KEEP
+
+Kernel sweep (3D DiffKV, nvfp4, 2 KV heads, us/call; bs1 q1):
+
+| depth  | seg16 | seg32 | seg64 | seg128 | seg256 | 2D-ref |
+|--------|-------|-------|-------|--------|--------|--------|
+| 16k    |    98 |    78 |    79 |     78 |     79 |    970 |
+| 64k    |   366 |   188 |   127 |     78 |     78 |  3,867 |
+| 200k   | 1,084 |   549 |   363 |    188 |    193 | 11,595 |
+| 512k   | 3,659 | 1,820 | 1,080 |    555 |    535 | 34,011 |
+| 1M     | 7,287 | 3,637 | 2,146 |  1,093 |  1,050 | 68,332 |
+
+HEADLINE 16 -> 128: 16k 98->78, 64k 366->78, 200k 1084->188,
+512k 3659->555, 1M 7287->1093 (6.7x). seg256 ~= seg128; bs4 similar
+(1M: 8548->3441). No 16k penalty. Numerics identical across segment
+counts (reduction-order only; cos unchanged to 6 decimals).
+
+AMPLIFIED FINDING: MTP-verify decode (q_len=2) was falling to the 2D
+kernel (one program walks the whole KV): 68ms/call at 1M vs 2.1ms in
+3D-seg128 (32x). Fix admits q_len<=2 into 3D (buffer rows are
+per-token; verified numerically).
+
+E2E BEFORE vs AFTER at ~200k depth (256k config, MTP on, two boots —
+segment count is baked at builder init, so runtime switching was not
+feasible): decode 13.4 -> 111.5 tok/s (8.3x). Short-prompt check:
+173.8/406.4 -> 187.5/414.9 single/C=4 (no regression; +8% single from
+MTP-verify now using 3D at short context too).
+
+Decision: fixed 128 (no depth-adaptive rule needed — 128 wins or ties
+everywhere measured). Committed.
