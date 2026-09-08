@@ -114,6 +114,7 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4SparseMLABackend):
         "fp8",
         "fp8_e4m3",
         "fp8_ds_mla",
+        "nvfp4_ds_mla",
     ]
 
     @staticmethod
@@ -163,14 +164,25 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4SparseMLABackend):
                 return "kv_cache_dtype not supported"
             return None
         if device_capability.major == 12:
-            if kv_cache_dtype not in ("fp8", "fp8_e4m3", "fp8_ds_mla"):
+            if kv_cache_dtype not in ("fp8", "fp8_e4m3", "fp8_ds_mla", "nvfp4_ds_mla"):
                 return "kv_cache_dtype not supported"
-            from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
+            from vllm.utils.flashinfer import (
+                has_flashinfer_sparse_mla_sm120,
+                has_flashinfer_sparse_mla_sm120_nvfp4,
+            )
 
             if not has_flashinfer_sparse_mla_sm120():
                 return (
                     "FLASHINFER_MLA_SPARSE_DSV4 SM120 requires FlashInfer's "
                     "sparse MLA decode API"
+                )
+            if (
+                kv_cache_dtype == "nvfp4_ds_mla"
+                and not has_flashinfer_sparse_mla_sm120_nvfp4()
+            ):
+                return (
+                    "nvfp4_ds_mla requires FlashInfer's NVFP4 sparse MLA "
+                    "modules (flashinfer-ai/flashinfer#4955)"
                 )
             return None
         return "FLASHINFER_MLA_SPARSE_DSV4 requires SM10x or SM12x"
@@ -657,7 +669,10 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
 
     def __init__(self, vllm_config: VllmConfig, *args, **kwargs) -> None:
         super().__init__(vllm_config, *args, **kwargs)
-        from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120_config
+        from vllm.utils.flashinfer import (
+            has_flashinfer_sparse_mla_sm120_config,
+            has_flashinfer_sparse_mla_sm120_nvfp4_config,
+        )
 
         required_topk = _required_sm120_sparse_topk(vllm_config, self.window_size)
         if not has_flashinfer_sparse_mla_sm120_config(self.padded_heads, required_topk):
@@ -667,6 +682,22 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 f"(num_q_heads={self.padded_heads}, top_k={required_topk}). "
                 "Install a FlashInfer build containing "
                 "flashinfer-ai/flashinfer#4380."
+            )
+        if (
+            self.kv_cache_dtype == "nvfp4_ds_mla"
+            and not has_flashinfer_sparse_mla_sm120_nvfp4_config(
+                self.padded_heads, required_topk
+            )
+        ):
+            # Unlike fp8, the NVFP4 decode family specializes top_k statically,
+            # so an installed FlashInfer may support nvfp4_ds_mla yet lack this
+            # configuration.
+            raise RuntimeError(
+                "nvfp4_ds_mla on SM120 requires a FlashInfer NVFP4 DSV4 sparse "
+                "MLA decode specialization for "
+                f"(num_q_heads={self.padded_heads}, top_k={required_topk}). "
+                "Install a FlashInfer build containing "
+                "flashinfer-ai/flashinfer#4955, or use --kv-cache-dtype fp8."
             )
         self._einsum_recipe, self._tma_aligned_scales = compute_fp8_einsum_recipe()
         # Per-tensor FP8 cache path scales.
@@ -861,6 +892,9 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             bmm1_scale=self.scale,
             sinks=self.attn_sink,
             kv_layout="NHD",
+            kv_cache_format=(
+                "nvfp4" if self.kv_cache_dtype == "nvfp4_ds_mla" else "fp8"
+            ),
             swa_topk_lens=swa_lens,
             extra_sparse_indices=extra_sparse_indices,
             extra_sparse_topk_lens=extra_sparse_lengths,
@@ -980,6 +1014,9 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 bmm1_scale=self.scale,
                 sinks=self.attn_sink,
                 kv_layout="NHD",
+                kv_cache_format=(
+                    "nvfp4" if self.kv_cache_dtype == "nvfp4_ds_mla" else "fp8"
+                ),
                 swa_topk_lens=swa_lens_chunk,
                 extra_sparse_indices=extra_sparse_indices_chunk,
                 extra_sparse_topk_lens=extra_sparse_lengths_chunk,

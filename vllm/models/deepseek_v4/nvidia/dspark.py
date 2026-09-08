@@ -221,6 +221,19 @@ class DSparkDeepseekV4Model(nn.Module):
             kv = attn.kv_norm(kv)
             if slot_mapping is None:
                 continue
+            if attn.kv_cache_dtype == "nvfp4_ds_mla":
+                from ..nvfp4_store import store_nvfp4_kv
+
+                # The fused insert op writes the fp8_ds_mla 584 B page; the
+                # nvfp4 page goes through rope + FlashInfer quantize-append.
+                store_nvfp4_kv(
+                    kv.contiguous(),
+                    attn.swa_cache_layer.kv_cache,
+                    slot_mapping,
+                    context_positions,
+                    attn.rotary_emb.cos_sin_cache,
+                )
+                continue
             _insert_context_kv(attn, kv, context_positions, slot_mapping)
 
     def forward(

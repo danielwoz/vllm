@@ -333,6 +333,11 @@ flashinfer_trtllm_batch_decode_sparse_mla_dsv4 = _lazy_import_wrapper(
     "trtllm_batch_decode_sparse_mla_dsv4",
     fallback_fn=_missing_sparse_mla,
 )
+flashinfer_nvfp4_quantize_append_sparse_mla_cache = _lazy_import_wrapper(
+    "flashinfer.mla",
+    "nvfp4_quantize_append_sparse_mla_cache",
+    fallback_fn=_missing_sparse_mla,
+)
 flashinfer_xqa_batch_decode_with_kv_cache = _lazy_import_wrapper(
     "flashinfer.decode",
     "xqa_batch_decode_with_kv_cache",
@@ -484,6 +489,46 @@ def has_flashinfer_sparse_mla_sm120_config(num_q_heads: int, top_k: int) -> bool
     mod = _get_submodule("flashinfer.mla._sparse_mla_sm120")
     dispatch = getattr(mod, "_DECODE_DSV4_DISPATCH", None) if mod else None
     return dispatch is not None and (int(num_q_heads), int(top_k)) in dispatch
+
+
+@functools.cache
+def _flashinfer_sparse_mla_sm120_nvfp4_configs():
+    """FlashInfer's NVFP4 SM120 sparse MLA capability table, or ``None``."""
+    if not has_flashinfer_sparse_mla_sm120():
+        return None
+    try:
+        from flashinfer.mla import (
+            nvfp4_quantize_append_sparse_mla_cache,
+            supported_sparse_mla_sm120_configs,
+        )
+    except ImportError:
+        return None
+    if not callable(nvfp4_quantize_append_sparse_mla_cache):
+        return None
+    try:
+        return supported_sparse_mla_sm120_configs(kv_cache_format="nvfp4")
+    except (TypeError, ValueError):
+        # FlashInfer predates the nvfp4 envelope.
+        return None
+
+
+def has_flashinfer_sparse_mla_sm120_nvfp4() -> bool:
+    """Return ``True`` if FlashInfer's NVFP4 sparse MLA support is available."""
+    configs = _flashinfer_sparse_mla_sm120_nvfp4_configs()
+    return configs is not None and "dsv4" in configs
+
+
+@functools.cache
+def has_flashinfer_sparse_mla_sm120_nvfp4_config(num_q_heads: int, top_k: int) -> bool:
+    """Return whether FlashInfer ships an SM120 NVFP4 DSV4 decode kernel.
+
+    The NVFP4 decode family specializes ``top_k`` statically (the fp8 family
+    takes it at runtime), so each serving configuration must be probed.
+    """
+    configs = _flashinfer_sparse_mla_sm120_nvfp4_configs()
+    if configs is None or "dsv4" not in configs:
+        return False
+    return configs["dsv4"].supports_decode(num_heads=int(num_q_heads), topk=int(top_k))
 
 
 @functools.cache
