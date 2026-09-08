@@ -43,20 +43,80 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-_FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE = 128 * 1024 * 1024
 _flashinfer_dsv4_workspace_by_device: dict[torch.device, torch.Tensor] = {}
+
+
+def _flashinfer_dsv4_workspace_bytes() -> int:
+    """Workspace bytes for the NVFP4 sparse-MLA kernels.
+
+    The kernel sizes its scratch by the number of query tokens in the batch
+    and rejects a buffer that cannot hold all of them, so this tracks the
+    shared FlashInfer sparse default rather than a fixed figure: a 128MiB
+    buffer is 2% short of a 2240-token batch with DSpark's four speculative
+    tokens.
+    """
+    from vllm import envs
+    from vllm.v1.attention.backends.mla.flashinfer_mla_sparse import (
+        _DEFAULT_WORKSPACE_BUFFER_SIZE,
+    )
+
+    if envs.is_set("VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE"):
+        return max(
+            envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE,
+            _DEFAULT_WORKSPACE_BUFFER_SIZE,
+        )
+    return _DEFAULT_WORKSPACE_BUFFER_SIZE
 
 
 def _get_flashinfer_dsv4_workspace(device: torch.device) -> torch.Tensor:
     workspace = _flashinfer_dsv4_workspace_by_device.get(device)
     if workspace is None:
         workspace = torch.zeros(
-            _FLASHINFER_DSV4_WORKSPACE_BUFFER_SIZE,
+            _flashinfer_dsv4_workspace_bytes(),
             dtype=torch.uint8,
             device=device,
         )
         _flashinfer_dsv4_workspace_by_device[device] = workspace
     return workspace
+
+
+# Primary-segment widths the NVFP4 sparse-MLA kernels instantiate. DSpark pads
+# its non-causal SWA index list to a 64-token alignment, which gives widths
+# (192 for a 128-token window plus 4 speculative tokens) that the FP8 kernels
+# accept but these do not.
+_NVFP4_PRIMARY_TOPK_WIDTHS = (128, 512)
+_nvfp4_swa_index_pad_cache: dict[
+    tuple[torch.device, int, int, torch.dtype], torch.Tensor
+] = {}
+
+
+def _pad_swa_indices_for_nvfp4(indices: torch.Tensor) -> torch.Tensor:
+    """Widen a DSpark SWA index list to a width the NVFP4 kernels instantiate.
+
+    Padding slots are set to -1, which the kernel treats as masked, and the
+    true count still comes from ``swa_topk_lens``, so the attended window is
+    unchanged -- only the index array is wider.
+    """
+    width = indices.shape[-1]
+    if width in _NVFP4_PRIMARY_TOPK_WIDTHS:
+        return indices
+    target = next((w for w in _NVFP4_PRIMARY_TOPK_WIDTHS if w >= width), None)
+    if target is None:
+        raise ValueError(
+            f"NVFP4 sparse MLA primary top-k {width} exceeds the widest "
+            f"instantiated width {_NVFP4_PRIMARY_TOPK_WIDTHS[-1]}"
+        )
+
+    key = (indices.device, indices.shape[0], target, indices.dtype)
+    buf = _nvfp4_swa_index_pad_cache.get(key)
+    if buf is None:
+        buf = torch.empty(
+            (indices.shape[0], target), dtype=indices.dtype, device=indices.device
+        )
+        _nvfp4_swa_index_pad_cache[key] = buf
+    buf[:, width:].fill_(-1)
+    buf[:, :width].copy_(indices.reshape(indices.shape[0], width))
+    return buf.view(*indices.shape[:-1], target)
 
 
 def _packed_block_span(pool: torch.Tensor) -> int:
@@ -114,6 +174,8 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4SparseMLABackend):
         "fp8",
         "fp8_e4m3",
         "fp8_ds_mla",
+        "nvfp4_ds_mla",
+        "nvfp4",
     ]
 
     @staticmethod
@@ -163,7 +225,13 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4SparseMLABackend):
                 return "kv_cache_dtype not supported"
             return None
         if device_capability.major == 12:
-            if kv_cache_dtype not in ("fp8", "fp8_e4m3", "fp8_ds_mla"):
+            if kv_cache_dtype not in (
+                "fp8",
+                "fp8_e4m3",
+                "fp8_ds_mla",
+                "nvfp4_ds_mla",
+                "nvfp4",
+            ):
                 return "kv_cache_dtype not supported"
             from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
 
@@ -855,12 +923,19 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
             query=q,
             swa_kv_cache=swa_cache,
             workspace_buffer=self._get_workspace(q.device),
-            sparse_indices=swa_indices,
+            sparse_indices=(
+                _pad_swa_indices_for_nvfp4(swa_indices)
+                if self.kv_cache_dtype == "nvfp4_ds_mla"
+                else swa_indices
+            ),
             compressed_kv_cache=extra_cache,
             out=output,
             bmm1_scale=self.scale,
             sinks=self.attn_sink,
             kv_layout="NHD",
+            kv_cache_format=(
+                "nvfp4" if self.kv_cache_dtype == "nvfp4_ds_mla" else "fp8"
+            ),
             swa_topk_lens=swa_lens,
             extra_sparse_indices=extra_sparse_indices,
             extra_sparse_topk_lens=extra_sparse_lengths,
@@ -980,6 +1055,9 @@ class DeepseekV4FlashInferSM120Attention(DeepseekV4Attention):
                 bmm1_scale=self.scale,
                 sinks=self.attn_sink,
                 kv_layout="NHD",
+                kv_cache_format=(
+                    "nvfp4" if self.kv_cache_dtype == "nvfp4_ds_mla" else "fp8"
+                ),
                 swa_topk_lens=swa_lens_chunk,
                 extra_sparse_indices=extra_sparse_indices_chunk,
                 extra_sparse_topk_lens=extra_sparse_lengths_chunk,
