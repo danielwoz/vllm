@@ -625,7 +625,6 @@ def build_attn_metadata(
                     cached_attn_metadata[cache_key] = metadata
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
-        token_to_req_indices = common_attn_metadata._token_to_req_indices_cache
     return attn_metadata
 
 
