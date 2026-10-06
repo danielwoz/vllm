@@ -224,7 +224,7 @@ def test_offload_store_retains_draft_window_in_group_coordinates(dcp_size, repli
                 head_size=1,
                 dtype=torch.float32,
                 sliding_window=32768,
-                dcp_replicated=replicated,
+                dcp_sharded=not replicated,
             ),
         ),
     ]

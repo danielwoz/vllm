@@ -247,11 +247,11 @@ class DFlashAttention(Attention):
                 # so the proof block is not recycled before it can be hashed.
                 extra_retained_tokens=self.sliding_window,
                 kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
-                dcp_replicated=dcp_replicated,
+                dcp_sharded=not dcp_replicated,
             )
         spec = super().get_kv_cache_spec(vllm_config)
         if dcp_replicated and isinstance(spec, FullAttentionSpec):
-            spec = dataclasses.replace(spec, dcp_replicated=True)
+            spec = dataclasses.replace(spec, dcp_sharded=False)
         return spec
 
 

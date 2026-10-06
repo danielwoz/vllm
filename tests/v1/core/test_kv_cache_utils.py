@@ -3598,7 +3598,7 @@ def test_group_dcp_replicated_dflash_draft():
         head_size=64,
         dtype=torch.float16,
         sliding_window=2048,
-        dcp_replicated=True,
+        dcp_sharded=False,
     )
     assert target.page_size_bytes != draft.page_size_bytes
 
@@ -3626,7 +3626,7 @@ def test_group_dcp_replicated_dflash_with_hybrid_mla_target():
         head_size=128,
         dtype=torch.bfloat16,
         sliding_window=2048,
-        dcp_replicated=True,
+        dcp_sharded=False,
     )
     config = _grouping_config()
     groups = get_kv_cache_groups(
@@ -3898,14 +3898,14 @@ def _grouping_config():
             num_kv_heads=1,
             head_size=64,
             dtype=torch.float16,
-            dcp_replicated=True,
+            dcp_sharded=False,
         ),
         RSWASpec(
             block_size=16,
             num_kv_heads=1,
             head_size=64,
             dtype=torch.float16,
-            dcp_replicated=True,
+            dcp_sharded=False,
             rswa_window=64,
         ),
         SinkFullAttentionSpec(
@@ -3913,7 +3913,7 @@ def _grouping_config():
             num_kv_heads=1,
             head_size=64,
             dtype=torch.float16,
-            dcp_replicated=True,
+            dcp_sharded=False,
             sink_len=4,
         ),
         SlidingWindowMLASpec(
@@ -3921,7 +3921,7 @@ def _grouping_config():
             num_kv_heads=1,
             head_size=64,
             dtype=torch.float16,
-            dcp_replicated=True,
+            dcp_sharded=False,
             sliding_window=64,
         ),
     ],
@@ -3939,7 +3939,7 @@ def test_sliding_window_mla_uniformity_includes_dcp_replication():
         num_kv_heads=1,
         head_size=64,
         dtype=torch.float16,
-        dcp_replicated=True,
+        dcp_sharded=False,
         sliding_window=64,
     )
     sharded = SlidingWindowMLASpec(
@@ -3947,7 +3947,7 @@ def test_sliding_window_mla_uniformity_includes_dcp_replication():
         num_kv_heads=1,
         head_size=64,
         dtype=torch.float16,
-        dcp_replicated=False,
+        dcp_sharded=True,
         sliding_window=64,
     )
 
@@ -4000,7 +4000,7 @@ def test_disable_hybrid_manager_keeps_mixed_dcp_replication_separate():
         head_size=64,
         dtype=torch.float16,
         sliding_window=64,
-        dcp_replicated=True,
+        dcp_sharded=False,
     )
     config = SimpleNamespace(
         scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=True),
@@ -4184,7 +4184,7 @@ def test_kimi_parallel_draft_full_depth_cache_admission(
         dtype=torch.uint8,
         cache_dtype_str="fp8",
         sliding_window=32768,
-        dcp_replicated=True,
+        dcp_sharded=False,
         non_causal_multi_token_decode=non_causal,
     )
     config = _grouping_config()
@@ -4196,7 +4196,7 @@ def test_kimi_parallel_draft_full_depth_cache_admission(
             dtype=torch.bfloat16,
             sliding_window=4096,
             extra_retained_tokens=4096,
-            dcp_replicated=True,
+            dcp_sharded=False,
         )
         config.cache_config.kv_cache_layout = "BLHNC"
     config.speculative_config = SimpleNamespace(
@@ -4299,7 +4299,7 @@ def test_kimi_mla_dflash2_full_context_cache_admission(monkeypatch, group_size):
         mamba_cache_mode="align",
         num_speculative_blocks=7,
     )
-    full_draft = replace(mla, dcp_replicated=True, non_causal_multi_token_decode=True)
+    full_draft = replace(mla, dcp_sharded=False, non_causal_multi_token_decode=True)
     sliding_draft = SlidingWindowMLASpec(
         block_size=1280,
         num_kv_heads=1,
@@ -4307,7 +4307,7 @@ def test_kimi_mla_dflash2_full_context_cache_admission(monkeypatch, group_size):
         dtype=torch.uint8,
         cache_dtype_str="fp8",
         sliding_window=4096,
-        dcp_replicated=True,
+        dcp_sharded=False,
         non_causal_multi_token_decode=True,
     )
     full_layers = set(range(3, 92, 4)) | {92}

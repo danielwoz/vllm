@@ -28,7 +28,7 @@ def test_replay_below_published_attention_tail(
         num_kv_heads=1,
         head_size=1,
         dtype=torch.float32,
-        dcp_replicated=replicated,
+        dcp_sharded=not replicated,
     )
     effective = spec.block_size * (1 if replicated else dcp)
     boundary = leading_blocks * effective + 2048

@@ -222,7 +222,9 @@ def test_scheduler_preserves_recycling_import_capacity(
             - cache.external_boundary_reserved_blocks()
         )
         pressure.extend(cache.block_pool.get_new_blocks(max(0, spare)))
-        expected = min(16, max(1, length - max(prefix, consumer.num_computed_tokens)))
+        # A lone request is exempt from long_prefill_token_threshold, so it
+        # takes the whole 32-token step budget.
+        expected = min(32, max(1, length - max(prefix, consumer.num_computed_tokens)))
         output = scheduler.schedule()
         assert output.num_scheduled_tokens == {consumer.request_id: expected}
         assert consumer.num_preemptions == 0
@@ -927,8 +929,10 @@ def test_capacity_waiter_does_not_block_requests_ahead_of_it(policy):
 def test_restore_past_its_bounded_wait_is_admitted_to_recompute(monkeypatch):
     """The connector keeps deferring the refused restore; the scheduler admits it."""
     clock, warnings = bounded_wait_clock(monkeypatch, 30)
+    # A lone request is exempt from long_prefill_token_threshold, so the step
+    # budget bounds its first chunk.
     scheduler, cache, connector = import_scheduler(
-        num_blocks=64, long_prefill_token_threshold=64
+        num_blocks=64, long_prefill_token_threshold=64, max_num_batched_tokens=64
     )
     # A first chunk fits where the whole restore does not.
     scheduler.scheduler_reserve_full_isl = False

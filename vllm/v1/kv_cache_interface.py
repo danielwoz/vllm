@@ -516,20 +516,16 @@ class AttentionSpec(KVCacheSpec):
     """Tokens covered by one stored state. Ints > 1 compress multiple tokens
     into one state (DSv4 sparse MLA); fractions < 1 store multiple states per
     token (Whisper block pooling: ``Fraction(1, block_pool_size)``)."""
-    dcp_replicated: bool = False
-    """Whether every DCP rank stores the complete KV cache for this layer."""
 
     def __post_init__(self):
         super().__post_init__()
         if self.head_size_v is None:
             object.__setattr__(self, "head_size_v", self.head_size)
-        # dcp_sharded and dcp_replicated describe one choice from opposite
-        # sides, and specs are built through either name. Settle them so every
-        # reader sees the same answer; asking for replication wins.
-        if self.dcp_replicated:
-            object.__setattr__(self, "dcp_sharded", False)
-        elif not self.dcp_sharded:
-            object.__setattr__(self, "dcp_replicated", True)
+
+    @property
+    def dcp_replicated(self) -> bool:
+        """Whether every DCP rank stores the complete KV cache for this layer."""
+        return not self.dcp_sharded
 
     @property
     def num_heads(self) -> int:
@@ -658,7 +654,6 @@ class FullAttentionSpec(AttentionSpec):
             # If any layer in the group is non-causal, treat the group as
             # non-causal so the engine core disables incompatible scheduling.
             non_causal=any(spec.non_causal for spec in specs),
-            dcp_replicated=dcp_replicated.pop(),
         )
         for spec in specs:
             for f in fields(AttentionSpec):
@@ -768,7 +763,6 @@ class MLAAttentionSpec(FullAttentionSpec):
             non_causal_multi_token_decode=any(
                 spec.non_causal_multi_token_decode for spec in specs
             ),
-            dcp_replicated=dcp_replicated_set.pop(),
         )
         for spec in specs:
             for f in fields(AttentionSpec):
@@ -827,7 +821,6 @@ class RSWASpec(FullAttentionSpec):
             sliding_window=base.sliding_window,
             attention_chunk_size=base.attention_chunk_size,
             non_causal=base.non_causal,
-            dcp_replicated=base.dcp_replicated,
             rswa_window=rswa_windows.pop(),
         )
 
@@ -1067,7 +1060,6 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             tokens_per_state=tokens_per_state_set.pop(),
             model_version=model_version_set.pop(),
             bounded_replay=bounded_replay_set.pop(),
-            dcp_replicated=dcp_replicated_set.pop(),
             non_causal_multi_token_decode=non_causal_set.pop(),
             prefix_cache_enabled=specs[0].prefix_cache_enabled,
             prefill_replay_window=specs[0].prefill_replay_window,
@@ -1325,7 +1317,6 @@ class SinkFullAttentionSpec(FullAttentionSpec):
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
             non_causal=any(spec.non_causal for spec in specs),
-            dcp_replicated=dcp_replicated.pop(),
         )
         for spec in specs:
             for f in fields(AttentionSpec):

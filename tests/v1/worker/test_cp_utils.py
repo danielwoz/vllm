@@ -83,7 +83,7 @@ def test_replicated_draft_attention_executes_as_local_dcp(monkeypatch, backend_n
     backend = AttentionBackendEnum[backend_name].get_class()
     layer = SimpleNamespace(
         impl=layer_impl,
-        get_kv_cache_spec=lambda _config: SimpleNamespace(dcp_replicated=True),
+        get_kv_cache_spec=lambda _config: SimpleNamespace(dcp_sharded=False),
         get_attn_backend=lambda: backend,
     )
     monkeypatch.setattr(
@@ -119,7 +119,7 @@ def test_replicated_draft_rejects_backend_without_local_dcp(monkeypatch):
     )
     layer = SimpleNamespace(
         impl=layer_impl,
-        get_kv_cache_spec=lambda _config: SimpleNamespace(dcp_replicated=True),
+        get_kv_cache_spec=lambda _config: SimpleNamespace(dcp_sharded=False),
         get_attn_backend=lambda: backend,
     )
     monkeypatch.setattr(
@@ -146,7 +146,7 @@ def test_replicated_draft_rejects_missing_backend(monkeypatch):
             supports_mtp_with_cp_non_trivial_interleave_size=False,
             need_to_return_lse_for_decode=False,
         ),
-        get_kv_cache_spec=lambda _config: SimpleNamespace(dcp_replicated=True),
+        get_kv_cache_spec=lambda _config: SimpleNamespace(dcp_sharded=False),
     )
     monkeypatch.setattr(
         cp_utils,

@@ -523,7 +523,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             dtype=kv_cache_dtype,
             cache_dtype_str=self.kv_cache_dtype,
             kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
-            dcp_replicated=dcp_replicated,
+            dcp_sharded=not dcp_replicated,
             non_causal_multi_token_decode=self.non_causal_multi_token_decode,
         )
         if self.draft_kv_window:

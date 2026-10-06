@@ -2740,7 +2740,7 @@ def test_request_boundary_retains_complete_dflash_windows(dcp, missing_group):
                     head_size=1,
                     dtype=torch.float32,
                     sliding_window=8,
-                    dcp_replicated=True,
+                    dcp_sharded=False,
                 ),
             ),
             KVCacheGroupSpec(
@@ -2750,7 +2750,7 @@ def test_request_boundary_retains_complete_dflash_windows(dcp, missing_group):
                     num_kv_heads=1,
                     head_size=1,
                     dtype=torch.float32,
-                    dcp_replicated=True,
+                    dcp_sharded=False,
                 ),
             ),
         ],
