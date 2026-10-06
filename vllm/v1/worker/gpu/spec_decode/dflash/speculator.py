@@ -22,7 +22,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
-from vllm.v1.worker.gpu.cp_utils import cp_local_slot, maybe_prepare_dcp_local_seq_lens
+from vllm.v1.worker.gpu.cp_utils import cp_local_slot, prepare_dcp_local_seq_lens
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
@@ -520,7 +520,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             return None
         if dcp_local_seq_lens is None:
             if self.draft_cp_size > 1:
-                dcp_local_seq_lens = maybe_prepare_dcp_local_seq_lens(
+                dcp_local_seq_lens = prepare_dcp_local_seq_lens(
                     self.input_buffers.dcp_local_seq_lens,
                     self.input_buffers.seq_lens,
                     num_reqs,
