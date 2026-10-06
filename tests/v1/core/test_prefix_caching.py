@@ -6989,7 +6989,7 @@ def test_hybrid_fine_hit_retention_preserves_materialized_fallback():
         mamba_partial_cache_hit=True,
         hash_block_size=32,
         mamba_has_prefill_checkpoint_blocks=False,
-        mamba_fine_grained_prefix_cache=False,
+        mamba_shared_prefix_checkpoint=False,
     )
     chunk_ends = []
     while request.num_computed_tokens < request.num_tokens:

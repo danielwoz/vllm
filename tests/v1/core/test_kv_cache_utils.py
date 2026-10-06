@@ -3987,7 +3987,7 @@ def test_disable_hybrid_manager_skips_dflash_partition():
     assert set(groups[0].layer_names) == set(specs)
 
 
-def test_disable_hybrid_manager_rejects_mixed_dcp_replication():
+def test_disable_hybrid_manager_keeps_mixed_dcp_replication_separate():
     target = FullAttentionSpec(
         block_size=16,
         num_kv_heads=1,
@@ -4009,14 +4009,18 @@ def test_disable_hybrid_manager_rejects_mixed_dcp_replication():
         parallel_config=SimpleNamespace(pipeline_parallel_size=1),
     )
 
-    with pytest.raises(ValueError, match="DCP-replicated and DCP-sharded"):
-        get_kv_cache_groups(
-            config,
-            {
-                "model.layers.0.self_attn": target,
-                "model.layers.1.self_attn": draft,
-            },
-        )
+    groups = get_kv_cache_groups(
+        config,
+        {
+            "model.layers.0.self_attn": target,
+            "model.layers.1.self_attn": draft,
+        },
+    )
+    assert [group.layer_names for group in groups] == [
+        ["model.layers.0.self_attn"],
+        ["model.layers.1.self_attn"],
+    ]
+    assert groups[1].kv_cache_spec.dcp_replicated
 
 
 def test_dflash_draft_cache_partition_is_pp1_only():

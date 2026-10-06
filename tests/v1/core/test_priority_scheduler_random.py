@@ -93,8 +93,13 @@ def _mock_execute_model(
     request_ids.extend(scheduler_output.scheduled_cached_reqs.req_ids)
     random.shuffle(request_ids)
 
+    # A request cannot accept more drafts than were scheduled for it.
     num_output_tokens = [
-        random.randint(*num_output_tokens_range) for _ in range(len(request_ids))
+        min(
+            random.randint(*num_output_tokens_range),
+            1 + len(scheduler_output.scheduled_spec_decode_tokens.get(req_id, ())),
+        )
+        for req_id in request_ids
     ]
     sampled_token_ids = [
         [random.randint(0, 100) for _ in range(num_tokens)]

@@ -103,7 +103,7 @@ def test_positive_retention_boundary_is_materialized():
         mamba_has_prefill_checkpoint_blocks=True,
         hash_block_size=512,
         mamba_partial_cache_hit=False,
-        mamba_fine_grained_prefix_cache=False,
+        mamba_shared_prefix_checkpoint=False,
     )
     step = Scheduler._mamba_block_aligned_split(scheduler, req, 4089)
     assert step == 512, f"Crosses required token 4096 and ends at {3584 + step}"

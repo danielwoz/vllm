@@ -541,7 +541,7 @@ class BlockPool:
                 and skipped_end_token_idx is not None
                 else None
             ),
-            skipped_extra_keys=skipped_extra_keys,
+            skipped_extra_keys=to_event_extra_keys(skipped_extra_keys),
             group_idx=kv_cache_group_id,
             session_id=request.session_id,
         )

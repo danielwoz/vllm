@@ -2190,6 +2190,7 @@ def _promote_local_kv_cache_specs(
                     "extra_retained_tokens",
                     "prefix_cache_enabled",
                     "prefill_replay_window",
+                    "bounded_replay",
                 ),
                 block_size=block_size,
                 page_size_padded=promoted_page_size_padded(spec, block_size),
@@ -2248,17 +2249,8 @@ def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
 
     """
 
-    dcp_replication_modes = {
-        spec.dcp_replicated
-        for spec in kv_cache_spec.values()
-        if isinstance(spec, AttentionSpec)
-    }
-    if len(dcp_replication_modes) > 1:
-        raise ValueError(
-            "Hybrid KV cache manager cannot be disabled when attention layers "
-            "mix DCP-replicated and DCP-sharded KV cache specs. Remove "
-            "`--disable-hybrid-kv-cache-manager` or disable DCP."
-        )
+    # DCP-replicated and DCP-sharded specs are unified separately, so a
+    # replicated draft never shares a promoted spec with a sharded target.
     groups: defaultdict[bool, dict[str, KVCacheSpec]] = defaultdict(dict)
     for name, spec in kv_cache_spec.items():
         replicated = isinstance(spec, AttentionSpec) and not spec.dcp_sharded

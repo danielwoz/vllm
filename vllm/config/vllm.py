@@ -661,7 +661,7 @@ class VllmConfig:
             and current_platform.is_cuda()
             and model is not None
             and not model.enable_sleep_mode
-            and not model.enable_return_routed_experts
+            and not self.aux_output_config.enable_return_routed_experts
             and self.lora_config is None
             and model.hf_text_config.model_type
             in (
