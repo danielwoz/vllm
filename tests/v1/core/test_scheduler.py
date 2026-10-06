@@ -164,6 +164,7 @@ def test_full_boundary_hit_is_admitted_while_another_request_decodes(
         with monkeypatch.context() as patch:
             if admission_blocker == "capacity":
                 patch.setattr(scheduler, "max_num_running_reqs", 1)
+                patch.setattr(scheduler, "max_num_active_reqs", 1)
             elif admission_blocker == "allocation":
                 allocate = manager.allocate_slots
 

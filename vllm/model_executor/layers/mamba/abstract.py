@@ -99,11 +99,12 @@ class MambaBase(AttentionLayerBase):
             tp_replicated=self.is_kv_cache_tp_replicated,
             mamba_cache_mode=cache_config.mamba_cache_mode,
             boundary_capture=boundary_capture,
-            # ReplaySSM verifies the whole window off one checkpoint, so it
-            # never writes the baseline's per-draft-token state slots.
+            # ReplaySSM and KDA RecoverSSM verify the whole window off one
+            # checkpoint, so they never write the per-draft-token state slots.
             num_speculative_blocks=(
                 0
-                if cache_config.use_replayssm
+                if getattr(cache_config, "use_replayssm", False)
+                or getattr(cache_config, "use_kda_recoverssm", False)
                 else vllm_config.num_speculative_tokens
             ),
         )
