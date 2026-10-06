@@ -177,6 +177,9 @@ class KVCacheSpec:
     @property
     def prefix_replay_tokens(self) -> int:
         """DeepSeek-V4.1 only: bounded replay. Currently only for DSV41 SWA."""
+        return 0
+
+    @property
     def prefill_replay_tokens(self) -> int:
         """Minimum uncached suffix needed to rebuild private prefill state."""
         return 0

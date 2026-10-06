@@ -140,6 +140,9 @@ def dflash2_grouped_conv(
     group_size: int,
 ) -> torch.Tensor:
     return torch.ops.vllm.dflash2_grouped_conv(x, delta, base, block_size, group_size)
+
+
+@triton.jit
 def _round_to_bf16_rn(value):
     """Materialize a BF16 RN boundary and prevent multiply-add contraction."""
     return tl.inline_asm_elementwise(
