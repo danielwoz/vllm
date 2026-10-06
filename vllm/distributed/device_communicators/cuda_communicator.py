@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+from typing import TYPE_CHECKING
+
 import torch
 from torch.distributed import ProcessGroup
 
@@ -26,8 +28,60 @@ from .base_device_communicator import DeviceCommunicatorBase
 
 logger = init_logger(__name__)
 
+if TYPE_CHECKING:
+    from .b12x_pcie_all_reduce import B12xPcieAllReduce
+    from .b12x_roce_all_reduce import B12xRoceAllReduce
+
+
+# PyNCCL communicators shared by groups over the same ranks and device
+# (VLLM_SHARE_PYNCCL_COMMS): key -> [communicator, owners].
+_SHARED_PYNCCL: dict[tuple, list] = {}
+
+
+def _acquire_pynccl(group, device: torch.device):
+    """Return (communicator, share key, created).
+
+    With VLLM_SHARE_PYNCCL_COMMS, groups over the same ranks (for example TP,
+    DCP and EP at TP2+DCP2) reuse one NCCL communicator instead of each
+    allocating channel and P2P buffers. Every rank creates its groups in the
+    same order, so each rank makes the same reuse decision. The groups' device
+    collectives are issued from the current stream, so their order on the
+    shared communicator matches on every rank.
+    """
+    from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+
+    if not envs.VLLM_SHARE_PYNCCL_COMMS or isinstance(group, StatelessProcessGroup):
+        return PyNcclCommunicator(group=group, device=device), None, True
+    import torch.distributed as dist
+
+    key = (tuple(dist.get_process_group_ranks(group)), str(device))
+    entry = _SHARED_PYNCCL.get(key)
+    if entry is not None:
+        entry[1] += 1
+        logger.info("Reusing the PyNCCL communicator of ranks %s", key[0])
+        return entry[0], key, False
+    comm = PyNcclCommunicator(group=group, device=device)
+    _SHARED_PYNCCL[key] = [comm, 1]
+    return comm, key, True
+
+
+def _release_pynccl(comm, key: tuple | None) -> None:
+    if key is None:
+        comm.destroy()
+        return
+    entry = _SHARED_PYNCCL.get(key)
+    if entry is None or entry[0] is not comm:
+        comm.destroy()
+        return
+    entry[1] -= 1
+    if entry[1] == 0:
+        del _SHARED_PYNCCL[key]
+        comm.destroy()
+
 
 class CudaCommunicator(DeviceCommunicatorBase):
+    b12x_ar_comm: "B12xPcieAllReduce | B12xRoceAllReduce | None"
+
     def __init__(
         self,
         cpu_group: ProcessGroup,
@@ -56,6 +110,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
             use_flashinfer_allreduce = False
             use_flashinfer_pcie_ipc_allreduce = False
             use_aiter_allreduce = False
+            use_b12x_allreduce = False
+            use_roce_allreduce = False
         else:
             from vllm.distributed.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
 
@@ -75,12 +131,24 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 and not envs.VLLM_BATCH_INVARIANT
                 and bool(rocm_aiter_ops.is_custom_all_reduce_enabled())
             )
+            use_b12x_allreduce = (
+                use_custom_allreduce
+                and envs.VLLM_ENABLE_PCIE_ALLREDUCE
+                and envs.VLLM_PCIE_ALLREDUCE_BACKEND == "b12x"
+            )
+            use_roce_allreduce = (
+                use_custom_allreduce and envs.VLLM_ENABLE_ROCE_ALLREDUCE
+            )
+            if use_b12x_allreduce or use_roce_allreduce:
+                use_flashinfer_allreduce = False
 
         self.use_custom_allreduce = use_custom_allreduce
         self.use_torch_symm_mem = use_torch_symm_mem
         self.use_flashinfer_allreduce = use_flashinfer_allreduce
         self.use_flashinfer_pcie_ipc_allreduce = use_flashinfer_pcie_ipc_allreduce
         self.use_aiter_allreduce = use_aiter_allreduce
+        self.use_b12x_allreduce = use_b12x_allreduce
+        self.use_roce_allreduce = use_roce_allreduce
 
         # lazy import to avoid documentation build error
         from vllm.distributed.device_communicators.custom_all_reduce import (
@@ -99,12 +167,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
         from vllm.distributed.device_communicators.symm_mem import SymmMemCommunicator
 
         self.pynccl_comm: PyNcclCommunicator | None = None
+        self._pynccl_share_key: tuple | None = None
         if self.world_size > 1:
-            self.pynccl_comm = PyNcclCommunicator(
-                group=self.cpu_group if tcp_store_group is None else tcp_store_group,
-                device=self.device,
+            group = self.cpu_group if tcp_store_group is None else tcp_store_group
+            self.pynccl_comm, self._pynccl_share_key, created = _acquire_pynccl(
+                group, self.device
             )
-            if is_symmetric_memory_enabled():
+            if created and is_symmetric_memory_enabled():
                 register_nccl_symmetric_ops(self.pynccl_comm)
 
         self.ca_comm: CustomAllreduce | None = None
@@ -114,6 +183,28 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.fi_pcie_ipc_ar_comm: FlashInferPcieIpcAllReduce | None = None
         self.aiter_ar_comm: AiterCustomAllreduce | None = None
         self.use_aiter_ag_rs: bool = False
+        self.b12x_ar_comm = None
+
+        if self.use_b12x_allreduce and self.world_size > 1:
+            from .b12x_pcie_all_reduce import B12xPcieAllReduce
+
+            self.b12x_ar_comm = B12xPcieAllReduce(
+                group=self.cpu_group,
+                device_group=self.device_group,
+                device=self.device,
+                global_ranks=self.ranks,
+            )
+        elif self.use_roce_allreduce and self.world_size > 1:
+            # RoCEnante: multi-node DGX Spark one-shot RDMA collectives
+            # from b12x.comm.roce.
+            from .b12x_roce_all_reduce import B12xRoceAllReduce
+
+            self.b12x_ar_comm = B12xRoceAllReduce(
+                group=self.cpu_group,
+                device_group=self.device_group,
+                device=self.device,
+                global_ranks=self.ranks,
+            )
 
         # cuMem graph buffers cannot be IPC-registered; capture copies them instead.
         config = get_current_vllm_config_or_none()
@@ -148,7 +239,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 device=self.device,
             )
 
-        if use_custom_allreduce and self.aiter_ar_comm is None and self.world_size > 1:
+        if (
+            use_custom_allreduce
+            and self.aiter_ar_comm is None
+            and (self.b12x_ar_comm is None or self.b12x_ar_comm.disabled)
+            and self.world_size > 1
+        ):
             # Initialize a custom fast all-reduce implementation.
             self.ca_comm = CustomAllreduce(
                 group=self.cpu_group,
@@ -288,6 +384,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
         """
         all_potential_ar_backends = [
             "FLASHINFER_PCIE_IPC",
+            "B12X_PCIE",
+            "B12X_ROCENANTE",
             "FLASHINFER",
             "NCCL_SYMM_MEM",
             "QUICK_REDUCE",
@@ -302,6 +400,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
             and not self.fi_pcie_ipc_ar_comm.disabled
         ):
             enabled_ar_backends.append("FLASHINFER_PCIE_IPC")
+        if self.b12x_ar_comm is not None and not self.b12x_ar_comm.disabled:
+            enabled_ar_backends.append(
+                getattr(self.b12x_ar_comm, "backend_name", "B12X_PCIE")
+            )
         if self.fi_ar_comm is not None and not self.fi_ar_comm.disabled:
             enabled_ar_backends.append("FLASHINFER")
         # Mirror the static preconditions of `should_nccl_symm_mem_allreduce`:
@@ -353,6 +455,16 @@ class CudaCommunicator(DeviceCommunicatorBase):
         )
 
     def all_reduce(self, input_):
+        b12x_ar_comm = self.b12x_ar_comm
+        if (
+            b12x_ar_comm is not None
+            and not b12x_ar_comm.disabled
+            and b12x_ar_comm.should_custom_ar(input_)
+        ):
+            out = b12x_ar_comm.custom_all_reduce(input_)
+            assert out is not None
+            return out
+
         fi_ar_comm = self.fi_ar_comm
         use_fi_ar = (
             fi_ar_comm is not None
@@ -427,6 +539,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
             torch.distributed.all_reduce(out, group=self.device_group)
         return out
 
+    def all_reduce_in_place(self, input_: torch.Tensor) -> torch.Tensor:
+        """Use NCCL's aliasing contract for a caller-donated intermediate."""
+        pynccl_comm = self.pynccl_comm
+        if (
+            pynccl_comm is None
+            or pynccl_comm.disabled
+            or pynccl_comm.all_reduce(input_, out_tensor=input_) is None
+        ):
+            torch.distributed.all_reduce(input_, group=self.device_group)
+        return input_
+
     def custom_all_gather(self, input_: torch.Tensor) -> torch.Tensor | None:
         ca_comm = self.ca_comm
         if ca_comm is None:
@@ -446,6 +569,19 @@ class CudaCommunicator(DeviceCommunicatorBase):
         # gather-before-GEMM uses dim=0 with tp-aligned (uniform) shards.
         if dim < 0:
             dim += input_.dim()
+        # RoCEnante all-gather (writes the concatenated
+        # layout directly, so no reshape/copy follows).
+        b12x_ar_comm = self.b12x_ar_comm
+        should_all_gather = getattr(b12x_ar_comm, "should_all_gather", None)
+        all_gather = getattr(b12x_ar_comm, "all_gather", None)
+        if (
+            b12x_ar_comm is not None
+            and not b12x_ar_comm.disabled
+            and should_all_gather is not None
+            and should_all_gather(input_, dim)
+        ):
+            assert all_gather is not None
+            return all_gather(input_, dim)
         if dim == 0 and should_nccl_symm_mem_ag_rs():
             return self._all_gather_symm_mem(input_.contiguous())
 
@@ -679,8 +815,14 @@ class CudaCommunicator(DeviceCommunicatorBase):
             raise ValueError("No PyNCCL communicator found")
 
     def destroy(self):
+        for transport in getattr(self, "b12x_dcp_transports", {}).values():
+            transport.close()
+        self.b12x_dcp_transports = {}
+        if self.b12x_ar_comm is not None:
+            self.b12x_ar_comm.close()
+            self.b12x_ar_comm = None
         if self.pynccl_comm is not None:
-            self.pynccl_comm.destroy()
+            _release_pynccl(self.pynccl_comm, self._pynccl_share_key)
             self.pynccl_comm = None
         if self.ca_comm is not None:
             self.ca_comm = None

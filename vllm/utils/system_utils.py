@@ -21,6 +21,7 @@ from vllm.platforms.interface import in_wsl
 from vllm.ray.lazy_utils import is_in_ray_actor
 
 from .platform_utils import cuda_is_initialized, xpu_is_initialized
+from typing import TextIO
 
 logger = init_logger(__name__)
 
@@ -191,6 +192,27 @@ def set_process_title(
         name = f"{name}_{suffix}"
 
     setproctitle.setproctitle(f"{prefix}::{name}")
+
+
+class _UndecoratedLogStream:
+    """Borrow a log stream while bypassing its process-prefix writer."""
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._write = stream._original_write
+
+    def write(self, text):
+        return self._write(text)
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def undecorated_log_stream(stream: TextIO):
+    """Keep terminal control sequences outside the line-prefix decorator."""
+    return (
+        _UndecoratedLogStream(stream) if hasattr(stream, "_original_write") else stream
+    )
 
 
 def decorate_logs(

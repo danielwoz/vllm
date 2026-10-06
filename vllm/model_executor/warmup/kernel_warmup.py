@@ -13,12 +13,14 @@ import torch
 
 import vllm.envs as envs
 from vllm.logger import init_logger
-from vllm.model_executor.warmup.b12x_warmup import b12x_warmup
 from vllm.model_executor.warmup.cutedsl_warmup import cutedsl_warmup
 from vllm.model_executor.warmup.deep_gemm_warmup import deep_gemm_warmup
 from vllm.model_executor.warmup.flashinfer_autotune_cache import (
+    load_autotune_cache_on_all_ranks,
+    rank_union_cache_path,
     resolve_flashinfer_autotune_file,
-    write_flashinfer_autotune_cache,
+    save_flashinfer_autotune_cache,
+    save_rank_union_autotune_cache,
 )
 from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
     autotune_hisparse_flashinfer_attention,
@@ -191,9 +193,6 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     qwen_vl_triton_warmup(worker.model_runner)
     mamba_triton_warmup(worker.model_runner)
 
-    compilation_config = worker.vllm_config.compilation_config
-    cudagraph_capture_sizes = list(compilation_config.cudagraph_capture_sizes or [])
-
     # Run next so input-prep kernels JIT against pristine runner state.
     if enable_jit_warmup:
         kimi_k3_triton_warmup(worker)
@@ -231,8 +230,6 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         model = worker.get_model()
         max_tokens = worker.scheduler_config.max_num_batched_tokens
         deep_gemm_warmup(model, max_tokens)
-
-    b12x_warmup(worker, cudagraph_capture_sizes)
 
     minimax_m3_msa_warmup(worker)
 
@@ -445,6 +442,11 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
         cache_path = cache_path.with_name(
             f"{cache_path.stem}_tp_{ranks}{cache_path.suffix}"
         )
+    multi_rank = world.world_size > 1
+    if multi_rank:
+        # Keys can be rank-specific (FlashInfer MoE keys include the EP rank),
+        # so multi-rank caches hold every rank's entries under their own name.
+        cache_path = rank_union_cache_path(cache_path)
     if is_leader:
         logger.info_once("Using FlashInfer autotune cache file: %s", cache_path)
 
@@ -453,16 +455,10 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     # which lead to some EP ranks receiving no tokens and skipping their
     # MoE kernel entirely, and cause hang due to all-reduce collective
     # during synchronized autotuning.
-    # Read cached autotune results and broadcast within the tuning group.
-    cached_results: bytes | None = None
-    if is_leader and cache_path.exists():
-        with open(cache_path, "rb") as f:
-            cached_results = f.read()
-    cached_results = tune_group.broadcast_object(cached_results, src=0)
-    if cached_results is not None:
-        write_flashinfer_autotune_cache(cache_path, cached_results)
-        tune_group.barrier()
-        tuner.load_configs(str(cache_path))
+    # Load the leader's cache on every rank of the tuning group, or on none: a
+    # cache hit skips a profile's all-reduce, so all ranks must make the same
+    # hit/miss decisions.
+    load_autotune_cache_on_all_ranks(cache_path, tuner, tune_group)
 
     group = tune_group.cpu_group if tune_group.world_size > 1 else None
     set_autotune_process_group(group)
@@ -488,7 +484,8 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     finally:
         set_autotune_process_group(None)
 
-    if world.world_size > 1:
+    if multi_rank:
         world.barrier()
-    if is_leader:
-        tuner.save_configs(str(cache_path))
+        save_rank_union_autotune_cache(cache_path, tuner, world)
+    else:
+        save_flashinfer_autotune_cache(cache_path, tuner)

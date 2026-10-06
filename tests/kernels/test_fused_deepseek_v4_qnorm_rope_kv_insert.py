@@ -12,7 +12,8 @@ We compare against:
     `dequantize_and_gather_k_cache` for KV
 
 The kernel is imported via
-`torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert`.
+`torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert` and writes Q
+into a caller-owned output tensor.
 """
 
 import pytest
@@ -174,6 +175,31 @@ def _call_fused(
     )
 
 
+def _call_fused_out(
+    q_in,
+    q_out,
+    kv,
+    k_cache,
+    slot_mapping,
+    positions,
+    cos_sin_cache,
+    eps,
+    bs,
+):
+    torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert.out(
+        q_in,
+        kv,
+        q_out,
+        k_cache,
+        slot_mapping,
+        positions,
+        cos_sin_cache,
+        eps,
+        bs,
+    )
+    return q_out
+
+
 def _as_stored_fp8(t: torch.Tensor) -> torch.Tensor:
     """Reinterpret a float8_e4m3fn-typed kernel output under the real (FNUZ on
     gfx942) encoding the kernel actually wrote, without touching the bytes."""
@@ -328,6 +354,41 @@ def test_q_path_without_qnorm_matches_rope_only_reference(num_tokens: int):
         atol=rope_atol,
     )
     assert q_out[:, n_heads:].count_nonzero().item() == 0
+
+
+def test_quant_insert_writes_caller_owned_q_out():
+    torch.manual_seed(4)
+    device = "cuda"
+    dtype = torch.bfloat16
+    eps = 1e-6
+    num_tokens = 17
+    n_heads = 8
+    padded_heads = 16
+    block_size = 16
+
+    q = torch.randn(num_tokens, n_heads, HEAD_DIM, dtype=dtype, device=device)
+    kv = torch.randn(num_tokens, HEAD_DIM, dtype=dtype, device=device)
+    positions = torch.arange(num_tokens, dtype=torch.int64, device=device)
+    cos_sin_cache = make_cos_sin_cache(4096, ROPE_DIM, torch.float32, device)
+    k_cache = torch.zeros(2, block_size * HEAD_BYTES, dtype=torch.uint8, device=device)
+    slot_mapping = torch.full((num_tokens,), -1, dtype=torch.int64, device=device)
+    q_out = torch.full(
+        (num_tokens, padded_heads, HEAD_DIM),
+        -123.0,
+        dtype=dtype,
+        device=device,
+    )
+
+    returned = _call_fused_out(
+        q, q_out, kv, k_cache, slot_mapping, positions, cos_sin_cache, eps, block_size
+    )
+
+    assert returned.data_ptr() == q_out.data_ptr()
+    q_ref = apply_rope_gptj_last_k(
+        rmsnorm_no_weight(q, eps), positions, cos_sin_cache
+    ).to(dtype)
+    torch.testing.assert_close(q_out[:, :n_heads], q_ref, rtol=1e-2, atol=1e-2)
+    assert q_out[:, n_heads:padded_heads].abs().max().item() == 0.0
 
 
 # ── Test 2: KV path round-trip byte/value parity ─────────────────────────────

@@ -169,9 +169,9 @@ def _fused_norm_rope_kernel(
     INDEXER_CACHE_HEAD_TILE: tl.constexpr,
     # MLA KV cache (concat kv_c_normed + k_pe_roped, uses slot_mapping_ptr)
     mla_cache_ptr,
+    mla_cache_block_size,
     mla_cache_block_stride,
     mla_cache_entry_stride,
-    MLA_CACHE_BLOCK_SIZE: tl.constexpr,
     MLA_CACHE_FP8: tl.constexpr,
     mla_cache_scale_ptr,
     # fp8_ds_mla cache views (block-scaled fp8 NoPE + unquantized bf16 RoPE).
@@ -291,9 +291,8 @@ def _fused_norm_rope_kernel(
             slot_idx = tl.load(slot_mapping_ptr + tok_idx)
             if slot_idx < 0:
                 return
-            mla_block_size = MLA_CACHE_BLOCK_SIZE
-            mla_block_idx = slot_idx // mla_block_size
-            mla_block_off = slot_idx % mla_block_size
+            mla_block_idx = slot_idx // mla_cache_block_size
+            mla_block_off = slot_idx % mla_cache_block_size
 
             if MLA_CACHE_NVFP4:
                 # nvfp4_ds_mla layout (352 B/token, KV_DIM == 512):
@@ -628,9 +627,9 @@ def fused_norm_rope(
     else:
         # Dummy cache values; a zero entry stride disables the cache write.
         mla_kv_cache = torch.empty(0, dtype=torch.bfloat16, device=device)
+        mla_block_size = 1
         mla_block_stride = 0
         mla_entry_stride = 0
-        mla_block_size = 1
         mla_k_scale = _dummy((1,), torch.float32, device)
 
     if q_c_out is None:
@@ -703,9 +702,9 @@ def fused_norm_rope(
         idx_cache_head_tile,
         # MLA KV cache (uses same slot_mapping)
         mla_kv_cache,
+        mla_block_size,
         mla_block_stride,
         mla_entry_stride,
-        mla_block_size,
         mla_cache_fp8,
         mla_k_scale,
         mla_ds_scale_view,
@@ -1127,16 +1126,15 @@ def _fused_eh_norm_kernel(
     H: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """MTP input fusion: zero embeds at position 0, RMSNorm(embeds) with enorm
-    and RMSNorm(prev_hidden) with hnorm, written side-by-side into ``out``
-    ([N, 2H]) ready for the eh_proj GEMM. Replaces where + 2x RMSNorm + cat."""
+    """MTP input fusion: RMSNorm(embeds) with enorm and RMSNorm(prev_hidden)
+    with hnorm, written side-by-side into ``out`` ([N, 2H]) ready for the
+    eh_proj GEMM. Replaces 2x RMSNorm + cat.
+    """
     tok = tl.program_id(0)
     off = tl.arange(0, BLOCK)
     mask = off < H
 
-    pos = tl.load(pos_ptr + tok)
     e = tl.load(embeds_ptr + tok * embeds_stride + off, mask=mask, other=0.0)
-    e = tl.where(pos == 0, 0.0, e.to(tl.float32))
     ew = tl.load(enorm_w_ptr + off, mask=mask)
     e_normed = _rms_norm(e, ew, eps, H)
     tl.store(out_ptr + tok * out_stride + off, e_normed, mask=mask)
@@ -1155,7 +1153,7 @@ def fused_eh_norm(
     hnorm_w: torch.Tensor,
     eps: float,
 ) -> torch.Tensor:
-    """Returns cat([enorm(masked embeds), hnorm(prev_hidden)]) -> [N, 2H]."""
+    """Returns cat([enorm(embeds), hnorm(prev_hidden)]) -> [N, 2H]."""
     n, h = inputs_embeds.shape
     out = torch.empty(n, 2 * h, dtype=inputs_embeds.dtype, device=inputs_embeds.device)
     _fused_eh_norm_kernel[(n,)](

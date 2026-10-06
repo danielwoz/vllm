@@ -236,6 +236,96 @@ def test_sampling_replay_config(config, message):
     else:
         with pytest.raises(ValueError, match=message):
             VllmConfig._verify_sampling_replay_config(config)
+@pytest.mark.parametrize("swa_size,prefix_unit", [(None, 256), (32, 64), (128, 96)])
+def test_swa_page_size_rejects_incompatible_prefix_matching(swa_size, prefix_unit):
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(architecture="DeepseekV41ForCausalLM"),
+        speculative_config=None,
+        cache_config=CacheConfig(
+            swa_block_size=swa_size, prefix_match_unit=prefix_unit
+        ),
+    )
+    with pytest.raises(ValueError, match="must be divisible by --prefix-match-unit"):
+        VllmConfig.validate_swa_block_size(config)
+    config.cache_config.prefix_match_unit = 32
+    VllmConfig.validate_swa_block_size(config)
+
+
+def test_swa_page_size_is_scoped_to_v41_target_and_draft():
+    target = SimpleNamespace(architecture="DeepseekV41ForCausalLM")
+    draft = SimpleNamespace(architecture="DSparkDeepseekV4ForCausalLM")
+    config = SimpleNamespace(
+        model_config=draft,
+        speculative_config=SimpleNamespace(
+            target_model_config=target, draft_model_config=draft
+        ),
+        cache_config=CacheConfig(swa_block_size=128, prefix_match_unit=32),
+    )
+    VllmConfig.validate_swa_block_size(config)
+    target.architecture = "DeepseekV4ForCausalLM"
+    with pytest.raises(ValueError, match="only supported by native DeepSeek V4.1"):
+        VllmConfig.validate_swa_block_size(config)
+    config.cache_config.swa_block_size = None
+    VllmConfig.validate_swa_block_size(config)
+
+
+@pytest.mark.parametrize(
+    "main,swa,expected,warning",
+    [
+        (None, None, (256, 128), False),
+        (256, 128, (256, 128), False),
+        (128, 64, (128, 64), False),
+        (128, None, (128, 128), True),
+        (128, 128, (128, 128), True),
+        (256, 64, (256, 64), True),
+        (256, 32, (256, 32), True),
+    ],
+)
+def test_swa_geometry_defaults_and_capacity_warning(main, swa, expected, warning):
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(architecture="DeepseekV41ForCausalLM"),
+        speculative_config=None,
+        cache_config=CacheConfig(
+            block_size=main, swa_block_size=swa, prefix_match_unit=32
+        ),
+    )
+    with patch.object(vllm_config_module.logger, "warning_once") as warn:
+        VllmConfig.validate_swa_block_size(config)
+    assert config.cache_config.block_size == expected[0]
+    assert (config.cache_config.swa_block_size or 128) == expected[1]
+    assert config.cache_config.swa_block_size == swa
+    assert config.cache_config.user_specified_block_size == (main is not None)
+    if warning:
+        warn.assert_called_once()
+        message, *sizes = warn.call_args.args
+        assert tuple(sizes) == expected
+        assert "--block-size 256 --swa-block-size 128" in message
+        assert "--block-size 128 --swa-block-size 64" in message
+    else:
+        warn.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "configured,expected",
+    [(None, "auto"), ("b12x", "b12x"), ("FLASHINFER-CUTLASS", "flashinfer_cutlass")],
+)
+def test_moe_backend_deployment_default(monkeypatch, configured, expected):
+    monkeypatch.delenv("VLLM_DEFAULT_MOE_BACKEND", raising=False)
+    if configured is not None:
+        monkeypatch.setenv("VLLM_DEFAULT_MOE_BACKEND", configured)
+    assert KernelConfig().moe_backend == expected
+
+
+@pytest.mark.parametrize("backend", ["auto", "b12x", "flashinfer_cutlass"])
+def test_explicit_moe_backend_overrides_deployment_default(monkeypatch, backend):
+    monkeypatch.setenv("VLLM_DEFAULT_MOE_BACKEND", "b12x")
+    assert KernelConfig(moe_backend=backend).moe_backend == backend
+
+
+def test_invalid_moe_backend_deployment_default_fails_validation(monkeypatch):
+    monkeypatch.setenv("VLLM_DEFAULT_MOE_BACKEND", "not_a_backend")
+    with pytest.raises(ValidationError, match="moe_backend"):
+        KernelConfig()
 
 
 def test_kda_recoverssm_derivation_is_revalidated():
@@ -3853,6 +3943,28 @@ def test_watermarking_forces_model_runner_v2(monkeypatch):
         "Watermarking requires Model Runner V2 and overrides "
         "VLLM_USE_V2_MODEL_RUNNER=0."
     )
+
+
+@pytest.mark.parametrize("cost_scale", [0.0, -1.0])
+def test_adaptive_verification_cost_scale_must_be_positive(cost_scale):
+    with pytest.raises(ValidationError):
+        SpeculativeConfig(
+            method="ngram",
+            num_speculative_tokens=1,
+            adaptive_verification_cost_scale=cost_scale,
+        )
+
+
+def test_adaptive_verification_cost_scale_requires_adaptive_dspark():
+    with pytest.raises(
+        ValueError,
+        match="requires DSpark adaptive verification",
+    ):
+        SpeculativeConfig(
+            method="ngram",
+            num_speculative_tokens=1,
+            adaptive_verification_cost_scale=2.0,
+        )
 
 
 @patch("vllm.config.speculative.ModelConfig")

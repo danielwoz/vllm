@@ -99,6 +99,7 @@ from vllm.model_executor.models.utils import (
     extract_layer_index,
     sequence_parallel_chunk,
 )
+from vllm.model_executor.weight_transfer import materialize_weight
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -877,7 +878,7 @@ def _try_load_fp8_indexer_wk(
     ):
         return True
     entry = buf.setdefault(layer_prefix, {})
-    entry["weight" if is_weight else "scale"] = tensor
+    entry["weight" if is_weight else "scale"] = materialize_weight(tensor)
     if "weight" not in entry or "scale" not in entry:
         return True  # still waiting for the other param
 

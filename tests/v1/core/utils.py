@@ -8,6 +8,7 @@ from tests.v1.kv_connector.unit.utils import MockKVConfig
 from vllm.config import (
     CacheConfig,
     DiffusionConfig,
+    DeviceConfig,
     ECTransferConfig,
     KVTransferConfig,
     ModelConfig,
@@ -18,7 +19,14 @@ from vllm.config import (
     SpeculativeConfig,
     VllmConfig,
 )
-from vllm.config.scheduler import SchedulerPolicy
+from vllm.config.scheduler import (
+    DecodeRefillTarget,
+    MaxParallelPrefills,
+    PrefillComputeHalfLife,
+    PrefillComputeShare,
+    PrefillPolicy,
+    SchedulerPolicy,
+)
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
     MultiModalKwargsItem,
@@ -59,6 +67,14 @@ def create_scheduler(
     enable_prefix_caching: bool = False,
     long_prefill_token_threshold: int = 0,
     long_prefill_token_threshold_adaptive: bool = False,
+    prefill_compute_share: PrefillComputeShare | None = None,
+    prefill_compute_half_life: PrefillComputeHalfLife | None = None,
+    max_num_prefill_tokens_per_step: int = 0,
+    max_parallel_prefills: MaxParallelPrefills = 1,
+    prefill_policy: PrefillPolicy = "round-robin",
+    decode_refill_target: DecodeRefillTarget = "auto",
+    scheduling_policy: SchedulerPolicy = "fcfs",
+    device: str = "auto",
     disable_chunked_mm_input: bool = False,
     mm_encoder_only: bool = False,
     use_kv_connector: None | bool | str | MockKVConfig = None,
@@ -74,12 +90,13 @@ def create_scheduler(
     pipeline_parallel_size: int = 1,
     data_parallel_size: int = 1,
     num_speculative_tokens_per_batch_size: list[tuple[int, int, int]] | None = None,
+    adaptive_speculative_tokens_window: int | None = None,
+    adaptive_speculative_tokens_initial: int | None = None,
     use_ec_connector: bool = False,
     ec_role: str | None = None,
     use_v2_model_runner: bool | None = None,
     kv_cache_spec: KVCacheSpec | None = None,
     per_request_spec_decode_metrics: str = "none",
-    scheduling_policy: SchedulerPolicy = "fcfs",
     diffusion_canvas_length: int | None = None,
     scheduler_cls: type[Scheduler] | None = None,
 ) -> Scheduler | AsyncScheduler:
@@ -123,13 +140,19 @@ def create_scheduler(
         max_model_len=max_model_len,
         long_prefill_token_threshold=long_prefill_token_threshold,
         long_prefill_token_threshold_adaptive=(long_prefill_token_threshold_adaptive),
+        prefill_compute_share=prefill_compute_share,
+        prefill_compute_half_life=prefill_compute_half_life,
+        max_num_prefill_tokens_per_step=max_num_prefill_tokens_per_step,
+        max_parallel_prefills=max_parallel_prefills,
+        prefill_policy=prefill_policy,
+        decode_refill_target=decode_refill_target,
+        policy=scheduling_policy,
         disable_chunked_mm_input=disable_chunked_mm_input,
         enable_chunked_prefill=enable_chunked_prefill,
         async_scheduling=async_scheduling,
         is_encoder_decoder=model_config.is_encoder_decoder,
         # Ensure admission/preemption mechanics are deterministic
         watermark=0.0,
-        policy=scheduling_policy,
     )
     # Cache config, optionally force APC
     cache_config = CacheConfig(
@@ -178,6 +201,16 @@ def create_scheduler(
             spec_kwargs["prompt_lookup_min"] = 1
         speculative_config = SpeculativeConfig(**spec_kwargs)
         speculative_config.parallel_drafting = parallel_drafting
+        if adaptive_speculative_tokens_window is not None:
+            # Scheduler tests use the local ngram fixture to avoid loading a
+            # draft model, then exercise the model-backed control path.
+            speculative_config.method = "mtp"
+            speculative_config.adaptive_speculative_tokens_window = (
+                adaptive_speculative_tokens_window
+            )
+            speculative_config.adaptive_speculative_tokens_initial = (
+                adaptive_speculative_tokens_initial
+            )
 
     ec_transfer_config = (
         ECTransferConfig(
@@ -196,6 +229,7 @@ def create_scheduler(
         diffusion_config = DiffusionConfig(canvas_length=diffusion_canvas_length)
 
     vllm_config = VllmConfig(
+        device_config=DeviceConfig(device=device),
         scheduler_config=scheduler_config,
         model_config=model_config,
         cache_config=cache_config,

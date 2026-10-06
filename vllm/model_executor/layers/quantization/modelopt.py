@@ -94,7 +94,10 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     requantize_with_max_scale,
 )
-from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from vllm.model_executor.parameter import (
     BlockQuantScaleParameter,
     ChannelQuantScaleParameter,
@@ -691,6 +694,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         topk_ids: torch.Tensor,
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
+        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor | UnfinalizedMoEOutput:
         assert not self.is_monolithic
         assert self.moe_kernel is not None
@@ -706,6 +710,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
+            workspace=workspace,
         )
 
 
@@ -955,8 +960,11 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         global_sf_num_experts = (
             global_num_experts if self.use_global_sf else num_experts
         )
+        # Zero, not uninitialized: W4A16_NVFP4 layers (such as GLM-5.3 MTP
+        # experts) store no input scales, and the b12x W4A16 A4 prefill takes
+        # any positive finite value here for a calibrated scale.
         w13_input_scale = PerTensorScaleParameter(
-            data=torch.empty(
+            data=torch.zeros(
                 global_sf_num_experts,
                 w13_num_shards,
                 dtype=torch.float32,
@@ -966,7 +974,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         layer.register_parameter("w13_input_scale", w13_input_scale)
 
         w2_input_scale = PerTensorScaleParameter(
-            data=torch.empty(global_sf_num_experts, dtype=torch.float32),
+            data=torch.zeros(global_sf_num_experts, dtype=torch.float32),
             weight_loader=weight_loader,
         )
         layer.register_parameter("w2_input_scale", w2_input_scale)
@@ -1104,6 +1112,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         topk_ids: torch.Tensor,
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
+        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor | UnfinalizedMoEOutput:
         assert not self.is_monolithic
         assert self.moe_kernel is not None
@@ -1119,6 +1128,7 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
+            workspace=workspace,
         )
 
 
@@ -1216,7 +1226,13 @@ class ModelOptMxFp8Config(ModelOptQuantConfigBase):
 
 
 class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
-    """FlashInfer TRTLLM MXFP8 block-scale MoE for ModelOpt checkpoints."""
+    """MXFP8 block-scale MoE for ModelOpt checkpoints.
+
+    The oracle (``select_mxfp8_moe_backend``) picks the expert backend:
+    FlashInfer TRTLLM, Triton, Marlin, emulation, or the b12x planned
+    ``w8a8_mx`` path on SM12x, which prepares directly from the serialized
+    E4M3 weights and UE8M0 K/32 scale grids.
+    """
 
     def __init__(
         self,
@@ -1228,7 +1244,9 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         self.quant_config = quant_config
         assert self.quant_config.is_checkpoint_mxfp8_serialized
 
-        self.mxfp8_backend, self.experts_cls = select_mxfp8_moe_backend(config=self.moe)
+        self.mxfp8_backend, self.experts_cls = select_mxfp8_moe_backend(
+            config=self.moe, prepares_b12x=True
+        )
 
     def create_weights(
         self,
@@ -1378,6 +1396,13 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         )
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        """Convert the loaded MXFP8 weights and build the MoE kernel once.
+
+        Runs the selected backend's weight converter, refreshes the quant
+        config and kernel, lets the experts class prepare its own
+        representation, and dequantizes to BF16 at load time on the emulation
+        backend. A second call for the same layer is a no-op.
+        """
         # TODO(bnell): why is this required only for mxfp8?
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
@@ -1413,6 +1438,10 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             experts_cls=self.experts_cls,
             routing_tables=layer._expert_routing_tables(),
         )
+        # The b12x experts prepare their planned representation here, before
+        # memory profiling and CUDA graph capture; every other MXFP8 expert
+        # class inherits the no-op default.
+        self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
         # No native MXFP8 MoE kernel on this device (e.g. gfx942): the emulation
         # experts would dequant MXFP8->BF16 every forward step. Convert the
@@ -1474,6 +1503,7 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
         topk_ids: torch.Tensor,
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
+        workspace: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor | UnfinalizedMoEOutput:
         assert not self.is_monolithic
         assert self.moe_kernel is not None
@@ -1489,6 +1519,7 @@ class ModelOptMxFp8FusedMoE(FusedMoEMethodBase):
             apply_router_weight_on_input=layer.apply_router_weight_on_input,
             shared_experts=shared_experts,
             shared_experts_input=shared_experts_input,
+            workspace=workspace,
         )
 
 
@@ -1520,6 +1551,21 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
         super().__init__(exclude_modules)
         self.kv_cache_quant_method = kv_cache_quant_method
         self.quantized_layers = quantized_layers
+        from .modelopt_iq2_xs import BLOCK_CODECS
+
+        for prefix, recipe in quantized_layers.items():
+            codec = recipe.get("quant_algo", "").upper()
+            if codec in BLOCK_CODECS and any(
+                recipe.get(key) != value
+                for key, value in {
+                    "group_size": BLOCK_CODECS[codec][0],
+                    "block_payload_bytes": BLOCK_CODECS[codec][1],
+                    "packing": "ggml",
+                }.items()
+            ):
+                raise ValueError(
+                    f"unsupported {codec} block contract for {prefix}: {recipe}"
+                )
         self.fp8_config = fp8_config
         self.nvfp4_config = nvfp4_config
         self.w4a16_nvfp4_config = w4a16_nvfp4_config
@@ -1768,6 +1814,20 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
             return None
 
         quant_algo = self._resolve_quant_algo(prefix)
+
+        if quant_algo in ("IQ2_XS", "IQ2_XXS", "Q8_0"):
+            from vllm.model_executor.layers.quantization.modelopt_iq2_xs import (
+                ModelOptIQ2XSLinearMethod,
+                ModelOptIQ2XSMoEMethod,
+            )
+
+            if isinstance(layer, RoutedExperts):
+                return ModelOptIQ2XSMoEMethod(
+                    layer.moe_config, codec=quant_algo.lower()
+                )
+            if isinstance(layer, (LinearBase, VocabParallelEmbedding)):
+                return ModelOptIQ2XSLinearMethod(codec=quant_algo.lower())
+            raise ValueError("IQ2_XS requires a dense linear or routed experts")
 
         if isinstance(layer, (LinearBase, ParallelLMHead)):
             # Per-prefix algo -> its sub-config, then the generic linear method.

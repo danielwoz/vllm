@@ -173,7 +173,7 @@ class SimpleCPUOffloadScheduler:
             kv_cache_config, offload_capacity
         )
         self.num_cpu_blocks = self.cpu_kv_cache_config.num_blocks
-        self.prefix_cacheable_group_ids = (
+        self.prefix_cacheable_group_ids = frozenset(
             self.cpu_kv_cache_config.prefix_cacheable_group_ids
         )
         self.kv_event_medium = MEDIUM_STORAGE if disk_capacity_bytes > 0 else MEDIUM_CPU
@@ -320,6 +320,8 @@ class SimpleCPUOffloadScheduler:
         target = 0
         for g in kv_cache_config.prefix_cacheable_groups:
             spec = g.kv_cache_spec
+            if not spec.prefix_cacheable:
+                continue
             block_size = resolve_dcp_kv_block_size(spec, cp_world_size)
             if isinstance(spec, MambaSpec):
                 target += 2
@@ -857,6 +859,8 @@ class SimpleCPUOffloadScheduler:
                 continue
             if len(gpu_block_ids) >= num_free:
                 break
+            if g not in self.prefix_cacheable_group_ids:
+                continue
             group_manager = self.cpu_coordinator.single_type_managers[g]
             if not group_manager.has_positionally_stable_blocks:
                 continue

@@ -599,33 +599,26 @@ def test_ple_embedding_dtype_overrides_modelopt_exclusion() -> None:
     )
 
 
-def test_pinned_embedding_forward_finalizes_prefetched_output(
+def test_pinned_embedding_forward_looks_up_current_ids(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     embedding = Qwen4ExpPLEPinnedHostEmbedding.__new__(Qwen4ExpPLEPinnedHostEmbedding)
     nn.Module.__init__(embedding)
-    embedding._prefetch_buffer = torch.empty(4, 2, 3, dtype=torch.float8_e4m3fn)
-    embedding._output_dim = 6
-    hidden_states = torch.zeros(2, 4, dtype=torch.bfloat16)
-    expected = torch.arange(12).reshape(2, 6).to(torch.float8_e4m3fn)
-
-    def finalize_prefetched(
-        prefetch_output: torch.Tensor,
-        output: torch.Tensor,
-    ) -> None:
-        assert prefetch_output is embedding._prefetch_buffer
-        output.copy_(expected)
-
+    table = torch.arange(24).reshape(8, 3).to(torch.float8_e4m3fn)
+    embedding.weight = nn.Parameter(table, requires_grad=False)
+    embedding.embedding_dim = 3
+    embedding.tp_size = 1
+    embedding.etp_data_parallel_size = 1
+    embedding.data_parallel_rank = 0
     monkeypatch.setattr(
         embedding,
-        "_finalize_prefetch",
-        finalize_prefetched,
+        "_lookup",
+        lambda ids: table.float()[ids].to(table.dtype),
     )
-
-    output = embedding(hidden_states)
-
-    assert output.dtype == embedding._prefetch_buffer.dtype
-    assert torch.equal(output, expected)
+    for ids in (torch.tensor([[0, 3], [1, 2]]), torch.tensor([[7, 1], [5, 6]])):
+        output = embedding(ids)
+        assert output.dtype == table.dtype
+        torch.testing.assert_close(output.float(), table.float()[ids])
 
 
 def test_pinned_embedding_forward_requires_prior_start_prefetch() -> None:

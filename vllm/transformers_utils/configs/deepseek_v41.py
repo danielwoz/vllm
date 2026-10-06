@@ -12,7 +12,7 @@ class DeepseekV41Config(PreTrainedConfig):
     tower under ``vision_config``. The vLLM model code (ported from
     ``deepseek_v4``) reads flat attributes, so both sub-configs are flattened
     onto the top level here: text fields are exposed as-is, vision fields
-    with the ``vision_*`` naming used by ``deepseek_v41.common.vision``.
+    with the ``vision_*`` attributes consumed by the vision encoder.
     """
 
     model_type = "deepseek_v41"
@@ -37,9 +37,10 @@ class DeepseekV41Config(PreTrainedConfig):
             # Don't clobber PreTrainedConfig properties (e.g. is_encoder_decoder).
             if isinstance(getattr(type(self), key, None), property):
                 continue
-            setattr(self, key, value)
+            kwargs.setdefault(key, value)
 
         super().__init__(**kwargs)
+        self.vision_config = vision_config
         if rope_scaling is not None:
             self.rope_parameters = rope_scaling
 
@@ -60,3 +61,7 @@ class DeepseekV41Config(PreTrainedConfig):
         self.vision_max_n_token = vision_config.get("max_image_tokens", 1024)
         self.vision_min_pixels = vision_config.get("min_pixels", 295936)
         self.vision_max_wh_ratio = vision_config.get("max_wh_ratio")
+        # Published image spans use the same causal SWA as text.
+        self.is_mm_prefix_lm = False
+        self.mm_prefix_clamp_sliding_window = False
+        self.mm_prefix_span_leading_pad_modulus = 0

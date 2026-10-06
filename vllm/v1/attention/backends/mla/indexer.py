@@ -39,6 +39,7 @@ from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_
 from vllm.v1.attention.backends.mla.sparse_utils import request_row_bounds
 from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
+    refresh_dcp_local_seq_lens_,
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import (
@@ -898,6 +899,24 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
     reorder_batch_threshold: int | None = None
     requires_block_table_width = True
 
+    def _supports_native_decode(self, next_n: int) -> bool:
+        return _supports_native_decode(next_n)
+
+    def _split_prefill_chunks(
+        self,
+        compressed_seq_lens_cpu: torch.Tensor,
+        prefill_query_lens_cpu: torch.Tensor,
+        num_decodes: int,
+        max_logits_bytes: int,
+    ) -> list[tuple[slice, slice]]:
+        return self._split_indexer_prefill_chunks(
+            self._prefill_split_seq_lens(compressed_seq_lens_cpu[num_decodes:]),
+            prefill_query_lens_cpu,
+            self.max_prefill_buffer_size,
+            max_logits_bytes,
+            request_offset=num_decodes,
+        )
+
     @classmethod
     def get_cudagraph_support(
         cls,
@@ -941,6 +960,13 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         self.reorder_batch_threshold = None
         self.use_flattening = _use_flattening(self.vllm_config)
         self.supports_varlen = _supports_varlen_paged_mqa_logits()
+        # Draft decode advances the shared global sequence lengths in place.
+        # The indexer keeps only two step-dependent snapshots: DCP-local
+        # sequence lengths and the DeepGEMM scheduling table. Both can be
+        # refreshed in place, including while a full CUDA graph is captured.
+        self.supports_draft_decode_metadata_update = (
+            current_platform.is_cuda() and has_deep_gemm()
+        )
         logger.info_once(
             "DSA indexer decode path: use_flattening=%s supports_varlen=%s "
             "(next_n=%d, use_fp4_cache=%s)",
@@ -1402,10 +1428,6 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 query_start_loc_cpu[num_decodes : num_decodes + num_prefills + 1]
             )
             max_logits_bytes = envs.VLLM_SPARSE_INDEXER_MAX_LOGITS_MB * 1024 * 1024
-            # Upper bound is exact for prefill rows (the `[num_decodes:]`
-            # slice below).
-            assert common_attn_metadata.seq_lens_cpu_upper_bound is not None
-            seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
             req_idx = None
             shard_rows = None
             if self.use_pcp and self.dcp_world_size > 1:
@@ -1433,12 +1455,11 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                     request_offset=num_decodes,
                 )
             else:
-                chunk_specs = self._split_indexer_prefill_chunks(
-                    self._prefill_split_seq_lens(compressed_seq_lens_cpu[num_decodes:]),
+                chunk_specs = self._split_prefill_chunks(
+                    compressed_seq_lens_cpu,
                     prefill_query_lens_cpu,
-                    self.max_prefill_buffer_size,
+                    num_decodes,
                     max_logits_bytes,
-                    request_offset=num_decodes,
                 )
 
             chunks = []
@@ -1518,7 +1539,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # The kernel sees max_decode_len Q rows, not the configured next_n,
             # so legality is per-step: on SM90 a uniformly 3-deep batch has no
             # native kernel. max_decode_len <= 1 always has one.
-            step_next_n_ok = max_decode_len <= 1 or _supports_native_decode(
+            step_next_n_ok = max_decode_len <= 1 or self._supports_native_decode(
                 max_decode_len
             )
             use_native = (
@@ -1730,6 +1751,71 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             )
             assert schedule_metadata.shape == decode.schedule_metadata.shape
             decode.schedule_metadata.copy_(schedule_metadata)
+        if metadata.num_decode_tokens == 0:
+            return
+
+        decode = metadata.decode
+        assert decode is not None
+        # The shared sequence-length tensor is advanced by update_draft_inputs.
+        # Rebuild the indexer's persistent per-token view in preallocated
+        # storage: ordinary fused drafting has width 1, while capture and native
+        # MTP metadata may retain the full speculative width.
+        if decode.seq_lens.ndim == 1:
+            seq_lens = decode.seq_lens.view(metadata.num_decodes, 1)
+        elif (
+            decode.seq_lens.ndim == 2
+            and decode.seq_lens.shape[0] == metadata.num_decodes
+        ):
+            seq_lens = decode.seq_lens
+        else:
+            raise RuntimeError(
+                "Fused indexer decode sequence lengths must have shape "
+                f"[{metadata.num_decodes}] or [{metadata.num_decodes}, N]; "
+                f"got {tuple(decode.seq_lens.shape)}"
+            )
+        global_seq_lens = decode.global_seq_lens
+        if global_seq_lens is None:
+            if self.dcp_world_size > 1:
+                raise RuntimeError(
+                    "Fused DCP indexer decode requires global sequence lengths"
+                )
+            global_seq_lens = metadata.seq_lens[: metadata.num_decodes]
+        else:
+            global_seq_lens = global_seq_lens[: metadata.num_decodes]
+
+        width = seq_lens.shape[1]
+        num_seq_lens = metadata.num_decodes * width
+        expanded_global_seq_lens = self.global_decode_seq_lens_buffer[
+            :num_seq_lens
+        ].view_as(seq_lens)
+        torch.add(
+            global_seq_lens.unsqueeze(1),
+            self.offsets_buffer[:width],
+            out=expanded_global_seq_lens,
+        )
+        expanded_global_seq_lens.add_(1 - width).clamp_(min=0)
+        if self.dcp_world_size > 1:
+            refresh_dcp_local_seq_lens_(
+                seq_lens.reshape(-1),
+                expanded_global_seq_lens.reshape(-1),
+                num_seq_lens,
+                self.dcp_world_size,
+                self.dcp_rank,
+                self.cp_kv_cache_interleave_size,
+            )
+        else:
+            seq_lens.copy_(expanded_global_seq_lens)
+
+        # The scheduler table depends on the effective context lengths. Keep
+        # its address stable so the same metadata is valid for CUDA replay.
+        schedule_metadata = get_paged_mqa_logits_metadata(
+            seq_lens,
+            self.kv_cache_spec.num_states,
+            self.num_sms,
+            indices=decode.indices,
+        )
+        assert schedule_metadata.shape == decode.schedule_metadata.shape
+        decode.schedule_metadata.copy_(schedule_metadata)
 
 
 def build_prefill_chunk_metadata(

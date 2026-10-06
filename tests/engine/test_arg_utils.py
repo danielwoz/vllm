@@ -490,6 +490,30 @@ def test_trust_request_mm_kwargs_cli():
 
     args = parser.parse_args(["--trust-request-mm-kwargs"])
     assert args.trust_request_mm_kwargs
+@pytest.mark.parametrize(
+    "flag,field,backends",
+    [
+        ("--gdn-decode-kernel", "gdn_decode_kernel", ("b12x", "cuda", "triton")),
+        (
+            "--gdn-prefill-backend",
+            "gdn_prefill_backend",
+            ("b12x", "flashinfer", "triton", "cutedsl"),
+        ),
+    ],
+)
+def test_gdn_backend_selection_args(flag, field, backends):
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+
+    args = parser.parse_args([])
+    assert getattr(EngineArgs.from_cli_args(args), field) is None
+
+    for backend in backends:
+        args = parser.parse_args([flag, backend])
+        assert getattr(EngineArgs.from_cli_args(args), field) == backend
+
+    parser.exit_on_error = False
+    with pytest.raises(ArgumentError):
+        parser.parse_args([flag, "invalid"])
 
 
 def test_attention_config():
@@ -622,6 +646,22 @@ def test_multi_node_world_size_includes_pcp(monkeypatch):
     )
     vllm_config = engine_args.create_engine_config()
     assert vllm_config.parallel_config.world_size == 2
+
+
+def test_swa_block_size_cli_choices(tmp_path):
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    model_args = ["--model", str(tmp_path)]
+    assert (
+        EngineArgs.from_cli_args(parser.parse_args(model_args)).swa_block_size is None
+    )
+    args = parser.parse_args([*model_args, "--swa-block-size", "None"])
+    assert EngineArgs.from_cli_args(args).swa_block_size is None
+    for size in (32, 64, 128):
+        args = parser.parse_args([*model_args, "--swa-block-size", str(size)])
+        assert EngineArgs.from_cli_args(args).swa_block_size == size
+    parser.exit_on_error = False
+    with pytest.raises(ArgumentError):
+        parser.parse_args(["--swa-block-size", "96"])
 
 
 def test_prefix_cache_default():
@@ -780,6 +820,43 @@ def test_numa_bind_args():
     assert engine_args.numa_bind is True
     assert engine_args.numa_bind_nodes == [0, 0, 1, 1]
     assert engine_args.numa_bind_cpus == ["0-3", "4-7", "8-11", "12-15"]
+
+
+@pytest.mark.parametrize(
+    "options,expected",
+    [
+        ([], "b12x"),
+        (["--moe-backend", "auto"], "auto"),
+        (["--moe-backend", "flashinfer-cutlass"], "flashinfer_cutlass"),
+        (["--kernel-config.moe_backend", "auto"], "auto"),
+        (["--kernel-config", '{"moe_backend":"triton"}'], "triton"),
+        (["--kernel-config.moe_backend", "triton", "--moe-backend", "auto"], "auto"),
+    ],
+)
+def test_moe_backend_cli_precedence(monkeypatch, tmp_path, options, expected):
+    """An omitted flat option preserves the nested deployment configuration."""
+    from transformers import LlamaConfig
+
+    from vllm.engine import arg_utils
+
+    monkeypatch.setenv("VLLM_DEFAULT_MOE_BACKEND", "b12x")
+    # Construct CLI defaults with the environment of a fresh serving process.
+    monkeypatch.setattr(
+        arg_utils, "_compute_kwargs", arg_utils._compute_kwargs.__wrapped__
+    )
+    LlamaConfig(
+        architectures=["LlamaForCausalLM"],
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        vocab_size=128,
+    ).save_pretrained(tmp_path)
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(["--model", str(tmp_path), *options])
+    engine_args = EngineArgs.from_cli_args(args)
+    assert engine_args.create_engine_config().kernel_config.moe_backend == expected
 
 
 def test_ir_op_priority():
