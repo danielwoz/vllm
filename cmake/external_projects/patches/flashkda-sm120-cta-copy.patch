@@ -1,9 +1,10 @@
 diff --git a/csrc/smxx/fwd_kernel2.cuh b/csrc/smxx/fwd_kernel2.cuh
+index 612ee0a..37a8d49 100644
 --- a/csrc/smxx/fwd_kernel2.cuh
 +++ b/csrc/smxx/fwd_kernel2.cuh
-@@ -2,6 +2,25 @@
- 
- #include "utils.cuh"
+@@ -27,6 +27,25 @@ constexpr int k2_min_blocks_per_sm() {
+     return (NumThreads == 256 && !FLASHKDA_K2_REG_REALLOC) ? 1 : 2;
+ }
  
 +__device__ __forceinline__ void copy_cta_workspace(
 +    void const* source, uint64_t* barrier, void* destination, int32_t bytes
@@ -27,7 +28,7 @@ diff --git a/csrc/smxx/fwd_kernel2.cuh b/csrc/smxx/fwd_kernel2.cuh
  template <int D, int CHUNK = 16, int VD = D>
  struct K2Layouts {
      using MMALayout = decltype(tile_to_shape(
-@@ -378,7 +397,7 @@
+@@ -444,32 +463,32 @@ _flash_kda_fwd_recurrence(
              // K1 stores byte images of its swizzled shared-memory tensors.
              // K2 uses the same layouts, so raw bulk copies restore them
              // directly without tensor-map coordinate work or repacking.
@@ -36,7 +37,7 @@ diff --git a/csrc/smxx/fwd_kernel2.cuh b/csrc/smxx/fwd_kernel2.cuh
                  ws_kd + int64_t(ws_idx) * (CHUNK * D),
                  reinterpret_cast<uint64_t*>(tma_barrier),
                  shared_storage.input[stage].k_decayed.begin(),
-@@ -386,7 +405,7 @@
+                 int32_t(CHUNK * D * sizeof(BF16)));
 -            cute::SM90_BULK_COPY_G2S::copy(
 +            copy_cta_workspace(
                  ws_qd + int64_t(ws_idx) * (CHUNK * D),
@@ -46,7 +47,9 @@ diff --git a/csrc/smxx/fwd_kernel2.cuh b/csrc/smxx/fwd_kernel2.cuh
 -            cute::SM90_BULK_COPY_G2S::copy(
 +            copy_cta_workspace(
                  ws_kr + int64_t(ws_idx) * (CHUNK * D),
-@@ -396,7 +415,7 @@
+                 reinterpret_cast<uint64_t*>(tma_barrier),
+                 shared_storage.input[stage].k_restored.begin(),
+                 int32_t(CHUNK * D * sizeof(BF16)));
 -            cute::SM90_BULK_COPY_G2S::copy(
 +            copy_cta_workspace(
                  ws_gt + int64_t(ws_idx) * D,
@@ -56,12 +59,11 @@ diff --git a/csrc/smxx/fwd_kernel2.cuh b/csrc/smxx/fwd_kernel2.cuh
 -            cute::SM90_BULK_COPY_G2S::copy(
 +            copy_cta_workspace(
                  ws_inv + int64_t(ws_idx) * (CHUNK * CHUNK),
-@@ -406,7 +425,7 @@
+                 reinterpret_cast<uint64_t*>(tma_barrier),
+                 shared_storage.input[stage].INV.begin(),
+                 int32_t(CHUNK * CHUNK * sizeof(BF16)));
 -            cute::SM90_BULK_COPY_G2S::copy(
 +            copy_cta_workspace(
                  ws_mqk + int64_t(ws_idx) * (CHUNK * CHUNK),
                  reinterpret_cast<uint64_t*>(tma_barrier),
                  shared_storage.input[stage].Mqk.begin(),
-                 int32_t(CHUNK * CHUNK * sizeof(BF16)));
- 
-             ++load_write;

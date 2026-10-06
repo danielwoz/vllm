@@ -1,5 +1,5 @@
 diff --git a/README.md b/README.md
-index 15583bb..1b8e4ca 100644
+index 15583bb..494684c 100644
 --- a/README.md
 +++ b/README.md
 @@ -74,7 +74,7 @@ bash tests/test.sh
@@ -64,7 +64,7 @@ index 15583bb..1b8e4ca 100644
  
  To set up IntelliSense (clangd) for the CUDA/C++ sources, run:
 diff --git a/csrc/flash_kda.cpp b/csrc/flash_kda.cpp
-index 5d54c43..e6aed79 100644
+index 7e28510..9bf6571 100644
 --- a/csrc/flash_kda.cpp
 +++ b/csrc/flash_kda.cpp
 @@ -44,7 +44,8 @@ void fwd(
@@ -105,7 +105,7 @@ index 5d54c43..e6aed79 100644
          STD_TORCH_CHECK(
              co.is_cuda() && co.is_contiguous(),
              "checkpoint_offsets must be a contiguous CUDA tensor");
-@@ -223,17 +225,35 @@ void fwd(
+@@ -222,17 +224,35 @@ void fwd(
      if (has_checkpoint) {
          auto& cs = checkpoint_state.value();
          auto& co = checkpoint_offsets.value();
@@ -145,7 +145,7 @@ index 5d54c43..e6aed79 100644
      }
  
      int total_tiles;
-@@ -248,11 +268,16 @@ void fwd(
+@@ -247,11 +267,16 @@ void fwd(
          SeqlenPtr typed_checkpoint_offsets = has_checkpoint
              ? static_cast<SeqlenPtr>(checkpoint_offsets->const_data_ptr())
              : nullptr;
@@ -162,7 +162,7 @@ index 5d54c43..e6aed79 100644
 +                typed_checkpoint_indptr, num_checkpoints, checkpoint_fp32, out_ptr, \
                  workspace_ptr, total_tiles, \
                  int(T_total), int(H), int(N_val), typed_cu_seqlens, \
-                 A_log_ptr, dt_bias_ptr, gate_scale, use_vsplit, stream)
+                 A_log_ptr, dt_bias_ptr, gate_scale, num_sms, stream)
 diff --git a/csrc/flash_kda.h b/csrc/flash_kda.h
 index e7f708f..e11079a 100644
 --- a/csrc/flash_kda.h
@@ -175,7 +175,7 @@ index e7f708f..e11079a 100644
 +    std::optional<torch::stable::Tensor> checkpoint_offsets = std::nullopt,
 +    std::optional<torch::stable::Tensor> checkpoint_indptr = std::nullopt);
 diff --git a/csrc/fwd.h b/csrc/fwd.h
-index 6ea6a86..a821d89 100644
+index df254a2..5211312 100644
 --- a/csrc/fwd.h
 +++ b/csrc/fwd.h
 @@ -22,6 +22,9 @@ void launch_fwd(
@@ -189,10 +189,10 @@ index 6ea6a86..a821d89 100644
      void* workspace_ptr,
      int total_tiles,
 diff --git a/csrc/smxx/fwd_kernel2.cuh b/csrc/smxx/fwd_kernel2.cuh
-index 6035090..9801216 100644
+index 4900929..612ee0a 100644
 --- a/csrc/smxx/fwd_kernel2.cuh
 +++ b/csrc/smxx/fwd_kernel2.cuh
-@@ -151,6 +151,9 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
+@@ -192,6 +192,9 @@ _flash_kda_fwd_recurrence(
      cutlass::bfloat16_t* out_raw_ptr,
      void* checkpoint_state_raw,
      SeqlenT const* checkpoint_offsets,
@@ -202,7 +202,7 @@ index 6035090..9801216 100644
      int T_total,
      int H,
      int N,
-@@ -165,7 +168,6 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
+@@ -206,7 +209,6 @@ _flash_kda_fwd_recurrence(
  ) {
      using BF16 = cutlass::bfloat16_t;
      using StateT = std::conditional_t<StateFP32, float, BF16>;
@@ -210,9 +210,9 @@ index 6035090..9801216 100644
      static_assert(D % VD == 0, "VD must divide D");
      static_assert(VD == 64 || VD == D,
                    "K2 currently supports the original V tile or VD=64");
-@@ -452,8 +454,22 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
+@@ -525,8 +527,22 @@ _flash_kda_fwd_recurrence(
          constexpr int kResidentStateRowBlocks = D / 16;
-         ResidentStateFragment resident_state[kValueBlocksPerWarp][kResidentStateRowBlocks];
+         ResidentStateAcc resident_state[kValueBlocksPerWarp][kResidentStateRowBlocks];
          SeqlenT checkpoint_offset = 0;
 +        int64_t checkpoint_index = seq_idx;
 +        int64_t checkpoint_end = seq_idx + 1;
@@ -234,7 +234,7 @@ index 6035090..9801216 100644
          }
  
          #pragma unroll
-@@ -773,16 +789,24 @@ __global__ void __launch_bounds__(NumThreads, 2) _flash_kda_fwd_recurrence(
+@@ -865,16 +881,24 @@ _flash_kda_fwd_recurrence(
                      cutlass::arch::NamedBarrier checkpoint_barrier(kComputeThreads, 0);
                      checkpoint_barrier.arrive_and_wait();
                      const int64_t checkpoint_base =
@@ -263,7 +263,7 @@ index 6035090..9801216 100644
              }
              // The collective commit releases this input stage and publishes
 diff --git a/csrc/smxx/fwd_launch.cu b/csrc/smxx/fwd_launch.cu
-index 0e145b6..6523d73 100644
+index 32ba9c0..3905786 100644
 --- a/csrc/smxx/fwd_launch.cu
 +++ b/csrc/smxx/fwd_launch.cu
 @@ -24,6 +24,9 @@ void launch_fwd(
@@ -276,15 +276,15 @@ index 0e145b6..6523d73 100644
      cutlass::bfloat16_t* out_ptr,
      void* workspace_ptr,
      int total_tiles,
-@@ -218,6 +221,7 @@ void launch_fwd(
-                 tma_store_final_state_vsplit,
-                 tma_store_out_vsplit,
-                 out_ptr, checkpoint_state_ptr, checkpoint_offsets_ptr,
-+                checkpoint_indptr_ptr, num_checkpoints, checkpoint_fp32,
-                 T_total, H, N, cu_seqlens_ptr, total_tiles,
-                 ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk);
-             return;
-@@ -248,6 +252,7 @@ void launch_fwd(
+@@ -234,6 +237,7 @@ void launch_fwd(
+                     tma_store_final_state_vsplit,
+                     tma_store_out_vsplit,
+                     out_ptr, checkpoint_state_ptr, checkpoint_offsets_ptr,
++                    checkpoint_indptr_ptr, num_checkpoints, checkpoint_fp32,
+                     T_total, H, N, cu_seqlens_ptr, total_tiles,
+                     ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk);
+                 return;
+@@ -265,6 +269,7 @@ void launch_fwd(
              tma_store_final_state,
              tma_store_out,
              out_ptr, checkpoint_state_ptr, checkpoint_offsets_ptr,
@@ -292,7 +292,7 @@ index 0e145b6..6523d73 100644
              T_total, H, N, cu_seqlens_ptr, total_tiles,
              ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk
          );
-@@ -261,7 +266,8 @@ void launch_fwd(
+@@ -278,7 +283,8 @@ void launch_fwd(
          cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, \
          cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, \
          cutlass::bfloat16_t const*, void const*, float, void*, \
@@ -300,7 +300,7 @@ index 0e145b6..6523d73 100644
 +        void*, SEQLEN_T const*, SEQLEN_T const*, int64_t, bool, \
 +        cutlass::bfloat16_t*, void*, \
          int, int, int, int, \
-         SEQLEN_T const*, float const*, float const*, float, bool, \
+         SEQLEN_T const*, float const*, float const*, float, int, \
          cudaStream_t);
 diff --git a/csrc/torch_api.cpp b/csrc/torch_api.cpp
 index a00ccbb..af43478 100644
