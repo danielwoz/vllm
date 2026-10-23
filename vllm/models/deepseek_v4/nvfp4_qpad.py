@@ -26,7 +26,7 @@ def _qnorm_rope_pad_kernel(
     HEAD_DIM: tl.constexpr,  # 512
     ROPE_DIM: tl.constexpr,  # 64
 ):
-    token = tl.program_id(0)
+    token = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1)
     out_base = out_ptr + (token * padded_heads + head) * HEAD_DIM
     d = tl.arange(0, HEAD_DIM)
@@ -36,7 +36,8 @@ def _qnorm_rope_pad_kernel(
         tl.store(out_base + d, tl.zeros([HEAD_DIM], dtype=tl.bfloat16))
         return
 
-    x = tl.load(q_ptr + (token * n_heads + head) * HEAD_DIM + d).to(tl.float32)
+    q_base = q_ptr + (token * n_heads + head) * HEAD_DIM
+    x = tl.load(q_base + d).to(tl.float32)
 
     # per-head RMSNorm, no weight
     rms = tl.sqrt(tl.sum(x * x) / HEAD_DIM + eps)
@@ -48,18 +49,8 @@ def _qnorm_rope_pad_kernel(
     cos = tl.load(cos_sin_ptr + pos * ROPE_DIM + i)
     sin = tl.load(cos_sin_ptr + pos * ROPE_DIM + 32 + i)
     nope: tl.constexpr = HEAD_DIM - ROPE_DIM
-    even = (
-        tl.load(q_ptr + (token * n_heads + head) * HEAD_DIM + nope + 2 * i).to(
-            tl.float32
-        )
-        / rms
-    )
-    odd = (
-        tl.load(q_ptr + (token * n_heads + head) * HEAD_DIM + nope + 2 * i + 1).to(
-            tl.float32
-        )
-        / rms
-    )
+    even = tl.load(q_base + nope + 2 * i).to(tl.float32) / rms
+    odd = tl.load(q_base + nope + 2 * i + 1).to(tl.float32) / rms
     r_even = even * cos - odd * sin
     r_odd = even * sin + odd * cos
 
@@ -78,7 +69,7 @@ def qnorm_rope_pad(
 ) -> torch.Tensor:
     """q: [T, H, 512] bf16 -> [T, padded_heads, 512] bf16 (normed+roped+padded)."""
     t, h, hd = q.shape
-    assert hd == 512 and q.dtype == torch.bfloat16
+    assert hd == 512 and q.dtype == torch.bfloat16 and q.is_contiguous()
     out = torch.empty((t, padded_heads, hd), dtype=q.dtype, device=q.device)
     _qnorm_rope_pad_kernel[(t, padded_heads)](
         q,

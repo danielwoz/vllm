@@ -53,8 +53,6 @@ class DeepseekV4SparseMLABackend(AttentionBackend):
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "auto",
         "fp8_ds_mla",
-        "nvfp4_ds_mla",
-        "nvfp4",  # alias for nvfp4_ds_mla
         "fp8",  # alias for fp8_ds_mla
     ]
 

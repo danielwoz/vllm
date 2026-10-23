@@ -118,9 +118,6 @@ def compress_norm_rope_store_triton(
                 COMPRESS_RATIO=compress_ratio,
                 OVERLAP=overlap,
                 ROPE_HEAD_DIM=rope_head_dim,
-                DCP_WORLD_SIZE=1,
-                DCP_RANK=0,
-                CP_KV_CACHE_INTERLEAVE_SIZE=1,
                 num_warps=4,
             )
             nvfp4_quantize_append_sparse_mla_cache(rows, out_slots, kv_cache)
@@ -783,19 +780,16 @@ def _fused_kv_compress_norm_rope_rows_nvfp4(
     COMPRESS_RATIO: tl.constexpr,
     OVERLAP: tl.constexpr,
     ROPE_HEAD_DIM: tl.constexpr,
-    DCP_WORLD_SIZE: tl.constexpr,
-    DCP_RANK: tl.constexpr,
-    CP_KV_CACHE_INTERLEAVE_SIZE: tl.constexpr,
 ):
     """Fused compress → RMSNorm → RoPE → bf16 row emit (nvfp4_ds_mla).
 
     Row-emitting twin of ``_fused_kv_compress_norm_rope_insert_sparse_attn``:
-    identical compression/decimation positions, DCP state gather, RMSNorm and
-    RoPE math (compressed positions). Instead of quantizing and inserting into
-    the paged cache it writes the finished bf16 latent row to ``out_rows`` and
-    the destination slot to ``out_slots``; tokens that produce no compressed
-    entry leave their ``out_slots`` entry at -1 so the FlashInfer append kernel
-    skips the (uninitialized) row.
+    identical compression/decimation positions, RMSNorm and RoPE math
+    (compressed positions). Instead of quantizing and inserting into the paged
+    cache it writes the finished bf16 latent row to ``out_rows`` and the
+    destination slot to ``out_slots``; tokens that produce no compressed entry
+    leave their ``out_slots`` entry at -1 so the FlashInfer append kernel skips
+    the (uninitialized) row.
     """
     token_idx = tl.program_id(0)
 
@@ -815,23 +809,9 @@ def _fused_kv_compress_norm_rope_rows_nvfp4(
     pos = start + tokens
     mask_pos = pos >= 0
 
-    if DCP_WORLD_SIZE == 1:
-        block_indices = pos // block_size
-        block_offsets = pos % block_size
-        local_pos_mask = mask_pos
-    else:
-        virtual_block_size = block_size * DCP_WORLD_SIZE
-        block_indices = pos // virtual_block_size
-        virtual_block_offsets = pos - block_indices * virtual_block_size
-        is_local = (
-            virtual_block_offsets // CP_KV_CACHE_INTERLEAVE_SIZE
-        ) % DCP_WORLD_SIZE == DCP_RANK
-        block_offsets = (
-            virtual_block_offsets // (DCP_WORLD_SIZE * CP_KV_CACHE_INTERLEAVE_SIZE)
-        ) * CP_KV_CACHE_INTERLEAVE_SIZE + (
-            virtual_block_offsets % CP_KV_CACHE_INTERLEAVE_SIZE
-        )
-        local_pos_mask = mask_pos & is_local
+    block_indices = pos // block_size
+    block_offsets = pos % block_size
+    local_pos_mask = mask_pos
     block_numbers = tl.load(
         block_table_ptr + req_idx * block_table_stride + block_indices,
         mask=local_pos_mask,

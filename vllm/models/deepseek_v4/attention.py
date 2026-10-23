@@ -108,12 +108,7 @@ def _resolve_dsv4_kv_cache_dtype(
         # opaque 384B/token NVFP4 page (group-16 E2M1 NoPE + E4M3 scales +
         # bf16 RoPE), packed as uint8. Distinct from the SM100 FlashMLA
         # nvfp4_ds_mla layout, which flashmla_sparse.py handles.
-        if kv_cache_dtype in ("nvfp4", "nvfp4_ds_mla"):
-            if kv_cache_dtype != "nvfp4_ds_mla":
-                if cache_config is not None:
-                    cache_config.cache_dtype = "nvfp4_ds_mla"
-                kv_cache_dtype = "nvfp4_ds_mla"
-                logger.info_once("Using DeepSeek's nvfp4_ds_mla KV cache format.")
+        if kv_cache_dtype == "nvfp4_ds_mla":
             return kv_cache_dtype, torch.uint8
         # fp8_ds_mla block format: UE8M0 block-scaled fp8 packed as uint8.
         if kv_cache_dtype == "auto":
@@ -818,8 +813,7 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
             #            the padding head slots; the kernel allocates and returns
             #            the padded q tensor.
             #   KV side: GPT-J RoPE + UE8M0 FP8 quant + paged cache insert.
-            swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
-            if swa_kv_cache.shape[-1] == 384:  # nvfp4_ds_mla page
+            if self.kv_cache_dtype == "nvfp4_ds_mla":
                 from .nvfp4_qpad import qnorm_rope_pad
                 from .nvfp4_store import store_nvfp4_kv
 
@@ -834,9 +828,9 @@ class DeepseekV4Attention(nn.Module, AttentionLayerBase, ABC):
                     swa_metadata.slot_mapping,
                     positions,
                     cos_sin_cache,
-                    swa_metadata.block_size,
                 )
                 return q
+            swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
             return torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
                 q,
                 kv,

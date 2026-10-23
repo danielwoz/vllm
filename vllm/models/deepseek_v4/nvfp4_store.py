@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-NVFP4 store for the DeepSeek-V4 sparse-MLA *main* 512-head KV cache.
+"""NVFP4 store for the DeepSeek-V4 sparse-MLA *main* 512-head KV cache.
 
 Replaces the KV side of the fp8_ds_mla C++ op
 ``torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert`` for the
@@ -52,8 +51,6 @@ def store_nvfp4_kv(
     slot_mapping: torch.Tensor,  # [num_tokens] int32/int64
     positions: torch.Tensor,  # [num_tokens] int64
     cos_sin_cache: torch.Tensor,  # [max_pos, 64] fp32 (cos||sin)
-    block_size: int,  # tokens per paged cache block (unused; ABI
-    # comes from kv_cache's shape)
 ) -> None:
     """RoPE + NVFP4-quantize the DSV4 main-KV latent into the paged cache.
 
